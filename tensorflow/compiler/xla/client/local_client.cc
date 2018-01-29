@@ -21,21 +21,14 @@ limitations under the License.
 #include "tensorflow/compiler/xla/ptr_util.h"
 #include "tensorflow/compiler/xla/service/backend.h"
 #include "tensorflow/compiler/xla/service/service_executable_run_options.h"
+#include "tensorflow/compiler/xla/service/source_map_util.h"
 #include "tensorflow/compiler/xla/status_macros.h"
 
 namespace se = ::perftools::gputools;
 
+using xla::source_map_util::InvalidParameterArgument;
+
 namespace xla {
-
-ExecutableBuildOptions& ExecutableBuildOptions::set_platform(
-    perftools::gputools::Platform* platform) {
-  platform_ = platform;
-  return *this;
-}
-
-perftools::gputools::Platform* ExecutableBuildOptions::platform() const {
-  return platform_;
-}
 
 ExecutableBuildOptions& ExecutableBuildOptions::set_device_ordinal(
     int device_ordinal) {
@@ -54,16 +47,6 @@ ExecutableBuildOptions& ExecutableBuildOptions::set_result_layout(
 
 const Shape* ExecutableBuildOptions::result_layout() const {
   return result_layout_set_ ? &result_layout_ : nullptr;
-}
-
-ExecutableBuildOptions& ExecutableBuildOptions::set_has_hybrid_result(
-    bool has_hybrid_result) {
-  has_hybrid_result_ = has_hybrid_result;
-  return *this;
-}
-
-bool ExecutableBuildOptions::has_hybrid_result() const {
-  return has_hybrid_result_;
 }
 
 namespace {
@@ -98,14 +81,15 @@ tensorflow::Status LocalExecutable::ValidateExecutionOptions(
   }
   for (int i = 0; i < arguments.size(); ++i) {
     if (!computation_layout.parameter_layout(i).MatchesLayoutInShape(
-            arguments[i]->shape())) {
-      return InvalidArgument(
-          "argument does not match shape or layout of computation parameter "
-          "%d: expected %s, got %s",
+            arguments[i]->on_host_shape())) {
+      return InvalidParameterArgument(
+          executable_.get(), i,
+          "Argument does not match shape or layout of computation parameter "
+          "%d: want %s, got %s",
           i,
           ShapeUtil::HumanString(computation_layout.parameter_layout(i).shape())
               .c_str(),
-          ShapeUtil::HumanString(arguments[i]->shape()).c_str());
+          ShapeUtil::HumanString(arguments[i]->on_host_shape()).c_str());
     }
   }
 
@@ -204,7 +188,7 @@ StatusOr<std::unique_ptr<ScopedShapedBuffer>> LocalExecutable::Run(
   }
   TF_ASSIGN_OR_RETURN(
       std::unique_ptr<ShapedBuffer> result,
-      executable_->ExecuteOnStreamWrapper<std::unique_ptr<ShapedBuffer>>(
+      executable_->ExecuteOnStreamWrapper(
           &service_options, options.execution_profile(), arguments));
   return ScopedShapedBuffer::MakeScoped(result.get(),
                                         actual_options.allocator());
@@ -230,9 +214,9 @@ tensorflow::Status LocalExecutable::RecordArguments(
     SessionModule* session_module) {
   session_module->clear_arguments();
   for (const ShapedBuffer* argument : arguments) {
-    Literal literal;
-    TF_RETURN_IF_ERROR(LiteralFromShapedBuffer(*argument, &literal));
-    *session_module->add_arguments() = literal.ToProto();
+    TF_ASSIGN_OR_RETURN(std::unique_ptr<Literal> literal,
+                        LiteralFromShapedBuffer(*argument));
+    *session_module->add_arguments() = literal->ToProto();
   }
   return Status::OK();
 }
@@ -240,21 +224,19 @@ tensorflow::Status LocalExecutable::RecordArguments(
 tensorflow::Status LocalExecutable::RecordResult(
     const ShapedBuffer* result, SessionModule* session_module) {
   session_module->clear_result();
-  Literal literal(session_module->result());
-  TF_RETURN_IF_ERROR(LiteralFromShapedBuffer(*result, &literal));
-  *session_module->mutable_result() = literal.ToProto();
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<Literal> literal,
+                      LiteralFromShapedBuffer(*result));
+  *session_module->mutable_result() = literal->ToProto();
   return Status::OK();
 }
 
-// TODO(dnovillo) Change signature to return StatusOr<Literal>.
-tensorflow::Status LocalExecutable::LiteralFromShapedBuffer(
-    const ShapedBuffer& shaped_buffer, Literal* literal) {
+StatusOr<std::unique_ptr<Literal>> LocalExecutable::LiteralFromShapedBuffer(
+    const ShapedBuffer& shaped_buffer) {
   TF_ASSIGN_OR_RETURN(
       se::StreamExecutor * executor,
       backend_->stream_executor(shaped_buffer.device_ordinal()));
-  return backend_->transfer_manager()->TransferLiteralFromDevice(
-      executor, shaped_buffer.buffer({}), shaped_buffer.shape(),
-      shaped_buffer.shape(), literal);
+  return backend_->transfer_manager()->TransferLiteralFromDevice(executor,
+                                                                 shaped_buffer);
 }
 
 se::Platform* LocalClient::platform() const {
@@ -297,58 +279,51 @@ StatusOr<std::unique_ptr<LocalExecutable>> LocalClient::Compile(
                                         device_ordinal, options));
 }
 
-// Copy the literal data to the device with the given ordinal and return as a
-// ScopedShapedBuffer. The given memory allocator is used for device memory
-// allocation.
 StatusOr<std::unique_ptr<ScopedShapedBuffer>>
 LocalClient::LiteralToShapedBuffer(const Literal& literal, int device_ordinal,
                                    DeviceMemoryAllocator* allocator) {
   if (allocator == nullptr) {
     allocator = backend().memory_allocator();
   }
-  TF_ASSIGN_OR_RETURN(
-      auto scoped_buffer,
-      ScopedShapedBuffer::Allocate(literal.shape(), allocator, device_ordinal));
+  TF_ASSIGN_OR_RETURN(auto scoped_buffer,
+                      backend().transfer_manager()->AllocateScopedShapedBuffer(
+                          literal.shape(), allocator, device_ordinal));
   TF_ASSIGN_OR_RETURN(se::StreamExecutor * executor,
                       backend().stream_executor(device_ordinal));
-  TF_RETURN_IF_ERROR(ShapeUtil::ForEachSubshapeWithStatus(
-      literal.shape(), [&](const Shape& subshape, const ShapeIndex& index) {
-        if (ShapeUtil::IsArray(subshape)) {
-          // This is a leaf of the shape. Transfer the literal array data to the
-          // device buffer.
-          return backend().transfer_manager()->TransferLiteralToDevice(
-              executor, literal.GetSubliteral(index),
-              scoped_buffer->mutable_buffer(index));
-        }
-        return Status::OK();
-      }));
+  TF_RETURN_IF_ERROR(backend().transfer_manager()->TransferLiteralToDevice(
+      executor, literal, *scoped_buffer));
   return std::move(scoped_buffer);
 }
 
-// Copy the data from the device contained in the given ShapedBuffer and
-// return as a Literal.
 StatusOr<std::unique_ptr<Literal>> LocalClient::ShapedBufferToLiteral(
     const ShapedBuffer& shaped_buffer) {
-  std::unique_ptr<Literal> literal =
-      Literal::CreateFromShape(shaped_buffer.shape());
   TF_ASSIGN_OR_RETURN(
       se::StreamExecutor * executor,
       backend().stream_executor(shaped_buffer.device_ordinal()));
-  TF_RETURN_IF_ERROR(ShapeUtil::ForEachSubshapeWithStatus(
-      literal->shape(), [&](const Shape& subshape, const ShapeIndex& index) {
-        if (ShapeUtil::IsArray(subshape)) {
-          // This is a leaf of the shape. Transfer the device buffer into the
-          // literal. The layout of the literal and the device buffer are
-          // necessarily the same so we pass 'subshape' for both device and
-          // literal shapes.
-          return backend().transfer_manager()->TransferLiteralFromDevice(
-              executor, shaped_buffer.buffer(index),
-              /*device_shape=*/subshape,
-              /*literal_shape*/ subshape, &literal->GetSubliteral(index));
-        }
-        return Status::OK();
-      }));
+  return backend().transfer_manager()->TransferLiteralFromDevice(executor,
+                                                                 shaped_buffer);
+}
+
+Status LocalClient::TransferToInfeedLocal(const Literal& literal,
+                                          int device_ordinal) {
+  TF_ASSIGN_OR_RETURN(se::StreamExecutor * executor,
+                      backend().stream_executor(device_ordinal));
+  return backend().transfer_manager()->TransferLiteralToInfeed(executor,
+                                                               literal);
+}
+
+StatusOr<std::unique_ptr<Literal>> LocalClient::TransferFromOutfeedLocal(
+    const Shape& shape, int device_ordinal) {
+  TF_ASSIGN_OR_RETURN(se::StreamExecutor * executor,
+                      backend().stream_executor(device_ordinal));
+  auto literal = MakeUnique<Literal>();
+  TF_RETURN_IF_ERROR(backend().transfer_manager()->TransferLiteralFromOutfeed(
+      executor, shape, literal.get()));
   return std::move(literal);
+}
+
+StatusOr<int> LocalClient::ReplicaNumberToDeviceOrdinal(int replica_number) {
+  return local_service_->ReplicaNumberToDeviceOrdinal(replica_number);
 }
 
 }  // namespace xla
