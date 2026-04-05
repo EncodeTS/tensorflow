@@ -48,7 +48,7 @@ class ListDiffOp : public OpKernel {
     const auto Ty = y.vec<T>();
     const size_t y_size = Ty.size();
 
-    OP_REQUIRES(context, x_size < std::numeric_limits<int32>::max(),
+    OP_REQUIRES(context, x_size < std::numeric_limits<int32_t>::max(),
                 errors::InvalidArgument("x too large for int32 indexing"));
 
     std::unordered_set<T> y_set;
@@ -59,7 +59,7 @@ class ListDiffOp : public OpKernel {
 
     // Compute the size of the output.
 
-    int64 out_size = 0;
+    int64_t out_size = 0;
     for (size_t i = 0; i < x_size; ++i) {
       if (y_set.count(Tx(i)) == 0) {
         ++out_size;
@@ -91,20 +91,20 @@ class ListDiffOp : public OpKernel {
   }
 };
 
-#define REGISTER_LISTDIFF(type)                                  \
-  REGISTER_KERNEL_BUILDER(Name("ListDiff")                       \
-                              .Device(DEVICE_CPU)                \
-                              .TypeConstraint<type>("T")         \
-                              .TypeConstraint<int32>("out_idx"), \
-                          ListDiffOp<type, int32>)               \
-  REGISTER_KERNEL_BUILDER(Name("ListDiff")                       \
-                              .Device(DEVICE_CPU)                \
-                              .TypeConstraint<type>("T")         \
-                              .TypeConstraint<int64>("out_idx"), \
+#define REGISTER_LISTDIFF(type)                                    \
+  REGISTER_KERNEL_BUILDER(Name("ListDiff")                         \
+                              .Device(DEVICE_CPU)                  \
+                              .TypeConstraint<type>("T")           \
+                              .TypeConstraint<int32>("out_idx"),   \
+                          ListDiffOp<type, int32>)                 \
+  REGISTER_KERNEL_BUILDER(Name("ListDiff")                         \
+                              .Device(DEVICE_CPU)                  \
+                              .TypeConstraint<type>("T")           \
+                              .TypeConstraint<int64_t>("out_idx"), \
                           ListDiffOp<type, int64>)
 
 TF_CALL_REAL_NUMBER_TYPES(REGISTER_LISTDIFF);
-REGISTER_LISTDIFF(string);
+REGISTER_LISTDIFF(tstring);
 #undef REGISTER_LISTDIFF
 
 }  // namespace tensorflow

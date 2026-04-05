@@ -15,10 +15,20 @@ limitations under the License.
 
 // An example Op.
 
+#include <string>
+
+#include "tensorflow/core/framework/common_shape_fns.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/framework/op_requires.h"
+#include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/framework/tensor_shape.h"
+#include "tensorflow/core/framework/types.h"
+#include "tensorflow/core/platform/tstring.h"
 
-REGISTER_OP("Fact").Output("fact: string");
+REGISTER_OP("Fact")
+    .Output("fact: string")
+    .SetShapeFn(tensorflow::shape_inference::UnknownShape);
 
 class FactOp : public tensorflow::OpKernel {
  public:
@@ -31,7 +41,7 @@ class FactOp : public tensorflow::OpKernel {
     OP_REQUIRES_OK(context, context->allocate_output(
                                 0, tensorflow::TensorShape(), &output_tensor));
     using tensorflow::string;
-    auto output = output_tensor->template scalar<string>();
+    auto output = output_tensor->template scalar<tensorflow::tstring>();
 
     output() = "0! == 1";
   }

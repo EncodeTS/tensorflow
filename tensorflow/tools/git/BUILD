@@ -2,25 +2,19 @@
 # Contains script to generate tensorflow/core/util/version_info.cc
 # Also contains information about git repository deposited by configure
 # in gen/...
-package(default_visibility = ["//tensorflow:internal"])
 
-licenses(["notice"])  # Apache 2.0
+load("@xla//third_party/rules_python/python:py_binary.bzl", "py_binary")
+load("//tensorflow:tensorflow.bzl", "if_oss")
 
-exports_files(
-    ["gen_git_source.py"],
+package(
+    # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
+    default_visibility = ["//tensorflow:internal"],
+    licenses = ["notice"],
 )
 
-# -----------------------------------------------------------------------------
-# Google-internal targets.  These must be at the end for syncrepo.
-
-filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-        ],
-    ),
-    visibility = ["//tensorflow:__subpackages__"],
+py_binary(
+    name = "gen_git_source",
+    srcs = ["gen_git_source.py"],
+    strict_deps = True,
+    tags = if_oss(["no-remote-exec"]),
 )

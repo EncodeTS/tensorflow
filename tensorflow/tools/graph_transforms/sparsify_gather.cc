@@ -18,18 +18,17 @@ limitations under the License.
 #include <unordered_map>
 
 #include "tensorflow/c/checkpoint_reader.h"
+#include "tensorflow/core/common_runtime/graph_constructor.h"
 #include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/graph/graph_constructor.h"
 #include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/graph/subgraph.h"
+#include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session.h"
-#include "tensorflow/core/util/command_line_flags.h"
 #include "tensorflow/core/util/tensor_bundle/tensor_bundle.h"
 #include "tensorflow/tools/graph_transforms/transform_utils.h"
 
 namespace tensorflow {
-using str_util::Join;
 using str_util::Split;
 using str_util::StringReplace;
 using strings::StrCat;
@@ -38,8 +37,8 @@ namespace graph_transforms {
 
 // Sparsify Tensor of shape [N, 1]. Return the indices and values vectors for
 // non-zero tensor content.
-Status SparsifyWeights(const Tensor& tensor, Tensor* indices_tensor,
-                       Tensor* values_tensor) {
+absl::Status SparsifyWeights(const Tensor& tensor, Tensor* indices_tensor,
+                             Tensor* values_tensor) {
   if (tensor.dims() != 2 || tensor.dim_size(1) != 1) {
     return tensorflow::errors::FailedPrecondition(
         "Transform only applicable to subgraph with 'Const' with "
@@ -48,10 +47,10 @@ Status SparsifyWeights(const Tensor& tensor, Tensor* indices_tensor,
   }
 
   auto flat = tensor.flat<float>();
-  std::vector<int64> indices;
+  std::vector<int64_t> indices;
   std::vector<float> values;
 
-  for (int64 i = 0; i < flat.size(); i++) {
+  for (int64_t i = 0; i < flat.size(); i++) {
     float val = flat(i);
     if (std::abs(val) >= 1.0e-5) {
       indices.push_back(i);
@@ -66,73 +65,97 @@ Status SparsifyWeights(const Tensor& tensor, Tensor* indices_tensor,
     indices.push_back(0);
     values.push_back(0);
   }
-  *indices_tensor = Tensor(DataTypeToEnum<int64>::value,
-                           {static_cast<int64>(indices.size())});
+  *indices_tensor = Tensor(DataTypeToEnum<int64_t>::value,
+                           {static_cast<int64_t>(indices.size())});
   std::copy_n(indices.begin(), indices.size(),
-              indices_tensor->flat<int64>().data());
+              indices_tensor->flat<int64_t>().data());
 
-  *values_tensor =
-      Tensor(DataTypeToEnum<float>::value, {static_cast<int64>(values.size())});
+  *values_tensor = Tensor(DataTypeToEnum<float>::value,
+                          {static_cast<int64_t>(values.size())});
   std::copy_n(values.begin(), values.size(),
               values_tensor->flat<float>().data());
 
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-void CreateConstNode(const Tensor& tensor, const string& name,
+void CreateConstNode(const Tensor& tensor, const std::string& name,
                      NodeDef* node_def) {
   node_def->set_op("Const");
   node_def->set_name(name);
   SetNodeTensorAttr<float>("value", tensor, node_def);
 }
 
-Status ObtainTensorSlice(const GraphDef& input_graph_def,
-                         const string& tensor_name,
-                         string* shape_slice_string) {
-  string restore_node_name;
+std::string GetMonolithicTensorKey(const std::string& tensor_slice_name) {
+  std::vector<std::string> names = Split(tensor_slice_name, "/");
+  if (absl::StartsWith(names[names.size() - 1], "part_")) {
+    CHECK_GE(names.size(), 2);
+    names.pop_back();
+  }
+  return absl::StrJoin(names, "/");
+}
+
+absl::Status ObtainTensorSlice(const GraphDef& input_graph_def,
+                               const std::string& target_name,
+                               std::string* shape_slice_string) {
+  std::string restore_node_name;
   for (const auto& node : input_graph_def.node()) {
-    std::vector<string> node_name_parts = Split(node.name(), "/");
+    std::vector<std::string> node_name_parts = Split(node.name(), "/");
     if (node_name_parts.size() == 2 &&
-        StringPiece(node_name_parts[0]).starts_with("save") &&
-        StringPiece(node_name_parts[1]).starts_with("Assign") &&
-        node.input(0) == tensor_name) {
+        absl::StartsWith(node_name_parts[0], "save") &&
+        absl::StartsWith(node_name_parts[1], "Assign") &&
+        node.input(0) == target_name) {
       restore_node_name = node.input(1);
       break;
     }
   }
-  string shape_and_slices_node;
+
+  std::vector<std::string> restore_node_parts = Split(restore_node_name, ":");
+  CHECK_LE(restore_node_parts.size(), 2);
+  std::string tensor_names_node;
+  std::string shape_and_slices_node;
   for (const auto& node : input_graph_def.node()) {
-    if ((node.name() == restore_node_name) && (node.op() == "RestoreV2")) {
+    if ((node.name() == restore_node_parts[0]) && (node.op() == "RestoreV2")) {
+      tensor_names_node = node.input(1);
       shape_and_slices_node = node.input(2);
       break;
     }
+  }
+
+  int offset = -1;
+  for (const auto& node : input_graph_def.node()) {
+    if (node.name() == tensor_names_node) {
+      Tensor tensor_names_tensor;
+      TF_RETURN_IF_ERROR(GetNodeAttr(node, "value", &tensor_names_tensor));
+      const auto& tensor_names_value = tensor_names_tensor.flat<tstring>();
+      for (int i = 0; i < tensor_names_value.size(); i++) {
+        if (tensor_names_value(i) == GetMonolithicTensorKey(target_name)) {
+          offset = i;
+          break;
+        }
+      }
+    }
+  }
+  if (offset == -1) {
+    return errors::Internal("Unable to find RestoreV2 entry for variable: ",
+                            target_name);
   }
   for (const auto& node : input_graph_def.node()) {
     if (node.name() == shape_and_slices_node) {
       Tensor shape_and_slices_tensor;
       TF_RETURN_IF_ERROR(GetNodeAttr(node, "value", &shape_and_slices_tensor));
       const auto& shape_and_slices_value =
-          shape_and_slices_tensor.flat<string>();
-      *shape_slice_string = shape_and_slices_value(0);
-      return Status::OK();
+          shape_and_slices_tensor.flat<tstring>();
+      *shape_slice_string = shape_and_slices_value(offset);
+      return absl::OkStatus();
     }
   }
-  return errors::Internal("Unable to find slice for variable: ", tensor_name);
+  return errors::Internal("Unable to find slice for variable: ", target_name);
 }
 
-string GetMonolithicTensorKey(const string& tensor_slice_name) {
-  std::vector<string> names = Split(tensor_slice_name, "/");
-  CHECK_GE(names.size(), 2);
-  CHECK(StringPiece(names[names.size() - 1]).starts_with("part_"));
-
-  // Remove the "part_x" suffix
-  names.pop_back();
-  return Join(names, "/");
-}
-
-Status ReadTensorFromCheckpoint(
-    const string& tensor_name, const std::unique_ptr<BundleReader>& ckpt_reader,
-    const string& shape_and_slice, Tensor* tensor) {
+absl::Status ReadTensorFromCheckpoint(
+    const std::string& tensor_name,
+    const std::unique_ptr<BundleReader>& ckpt_reader,
+    const std::string& shape_and_slice, Tensor* tensor) {
   if (ckpt_reader) {
     TensorShape parsed_full_shape;
     TensorSlice parsed_slice;
@@ -152,43 +175,64 @@ Status ReadTensorFromCheckpoint(
       TF_RETURN_IF_ERROR(
           ckpt_reader->Lookup(GetMonolithicTensorKey(tensor_name), tensor));
     }
-    return Status::OK();
+    return absl::OkStatus();
   }
   return errors::Internal("Checkpoint reader was not initialized. ");
 }
 
-Status InitializeCheckpointReader(const TransformFuncContext& context,
-                                  std::unique_ptr<BundleReader>* ckpt_reader) {
+absl::Status InitializeCheckpointReader(
+    const TransformFuncContext& context,
+    std::unique_ptr<BundleReader>* ckpt_reader) {
   if (context.params.count("input_checkpoint")) {
-    const string input_checkpoint = context.params.at("input_checkpoint")[0];
-    ckpt_reader->reset(new BundleReader(Env::Default(), input_checkpoint));
+    const std::string input_checkpoint =
+        context.params.at("input_checkpoint")[0];
+    *ckpt_reader =
+        std::make_unique<BundleReader>(Env::Default(), input_checkpoint);
     TF_RETURN_IF_ERROR((*ckpt_reader)->status());
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status ObtainVariableInfo(
+absl::Status ObtainVariableInfo(
     const GraphDef& input_graph_def,
-    std::unique_ptr<std::unordered_map<string, string> >* shapes_and_slices) {
-  shapes_and_slices->reset(new std::unordered_map<string, string>());
+    std::unique_ptr<std::unordered_map<std::string, std::string>>*
+        shapes_and_slices) {
+  *shapes_and_slices =
+      std::make_unique<std::unordered_map<std::string, std::string>>();
   for (const auto& node : input_graph_def.node()) {
     if ((node.op() == "Variable") || (node.op() == "VariableV2")) {
-      string s;
+      std::string s;
       TF_RETURN_IF_ERROR(ObtainTensorSlice(input_graph_def, node.name(), &s));
       (**shapes_and_slices)[node.name()] = s;
     }
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status SparsifyGatherInternal(
+absl::Status RemoveInputAtIndex(NodeDef* n, int index) {
+  for (int i = index; i < n->input_size() - 1; i++) {
+    n->mutable_input()->SwapElements(i, i + 1);
+  }
+  n->mutable_input()->RemoveLast();
+  return absl::OkStatus();
+}
+
+absl::Status RemoveNodeAtIndex(GraphDef* g, int index) {
+  for (int i = index; i < g->node_size() - 1; i++) {
+    g->mutable_node()->SwapElements(i, i + 1);
+  }
+  g->mutable_node()->RemoveLast();
+  return absl::OkStatus();
+}
+
+absl::Status SparsifyGatherInternal(
     const GraphDef& input_graph_def,
-    const std::unique_ptr<std::unordered_map<string, string> >&
+    const std::unique_ptr<std::unordered_map<std::string, std::string>>&
         shapes_and_slices,
     const TransformFuncContext& context, const OpTypePattern& pattern,
     const std::unique_ptr<BundleReader>& ckpt_reader,
     GraphDef* output_graph_def) {
-  string group_init_node = "group_deps";
+  std::string group_init_node = "group_deps";
   if (context.params.count("group_init_node")) {
     group_init_node = context.params.at("group_init_node")[0];
   }
@@ -196,7 +240,7 @@ Status SparsifyGatherInternal(
   bool any_match_found = false;
 
   // Populate references.
-  std::unordered_map<string, int> refs;
+  std::unordered_map<std::string, int> refs;
   for (const auto& node : current_graph_def.node()) {
     for (const auto& input : node.input()) {
       auto parsed_input = StringReplace(input, "^", "", true);
@@ -210,16 +254,16 @@ Status SparsifyGatherInternal(
   do {
     any_match_found = false;
     GraphDef replaced_graph_def = current_graph_def;
-    std::vector<string> init_table_node_names;
-    std::vector<string> removed_node_names;
+    std::vector<std::string> init_table_node_names;
+    std::vector<std::string> removed_node_names;
 
     TF_RETURN_IF_ERROR(ReplaceMatchingOpTypes(
         current_graph_def, pattern,
         [&ckpt_reader, &any_match_found, &init_table_node_names,
-         &shapes_and_slices, &removed_node_names,
-         &refs](const NodeMatch& match, const std::set<string>& input_nodes,
-                const std::set<string>& output_nodes,
-                std::vector<NodeDef>* new_nodes) {
+         &shapes_and_slices, &removed_node_names, &refs](
+            const NodeMatch& match, const std::set<std::string>& input_nodes,
+            const std::set<std::string>& output_nodes,
+            std::vector<NodeDef>* new_nodes) {
           any_match_found = true;
 
           // The captured subgraph should be of the following pattern:
@@ -263,11 +307,11 @@ Status SparsifyGatherInternal(
 
             Tensor axis_t;
             TF_RETURN_IF_ERROR(GetNodeAttr(axis_node, "value", &axis_t));
-            int64 axis = 0;
+            int64_t axis = 0;
             if (axis_t.dtype() == DT_INT32) {
-              axis = axis_t.scalar<int32>()();
+              axis = axis_t.scalar<int32_t>()();
             } else if (axis_t.dtype() == DT_INT64) {
-              axis = axis_t.scalar<int64>()();
+              axis = axis_t.scalar<int64_t>()();
             } else {
               return tensorflow::errors::FailedPrecondition(
                   "Gather axis was not int32 or int64.");
@@ -301,13 +345,13 @@ Status SparsifyGatherInternal(
             TF_RETURN_IF_ERROR(ReadTensorFromCheckpoint(
                 weights_node.name(), ckpt_reader,
                 (*shapes_and_slices)[weights_node.name()], &weight));
-            // Add both both weight and identity node names.
-            removed_node_names.push_back(weights_node.name());
-            removed_node_names.push_back(match.inputs[0].node.name());
-            for (auto input_node : match.inputs[0].node.input()) {
-              auto parsed_input = StringReplace(input_node, "^", "", true);
-              refs[parsed_input]--;
-            }
+          }
+          // Add both weight and identity node names.
+          removed_node_names.push_back(weights_node.name());
+          removed_node_names.push_back(match.inputs[0].node.name());
+          for (auto input_node : match.inputs[0].node.input()) {
+            auto parsed_input = StringReplace(input_node, "^", "", true);
+            refs[parsed_input]--;
           }
           Tensor indices_tensor;
           Tensor values_tensor;
@@ -318,19 +362,21 @@ Status SparsifyGatherInternal(
           DataType key_dtype = DT_INT64;
           NodeDef indices_node;
           CreateConstNode(indices_tensor,
-                          StrCat(weights_node.name(), "/indices"),
+                          absl::StrCat(weights_node.name(), "/indices"),
                           &indices_node);
           SetNodeAttr("dtype", key_dtype, &indices_node);
 
           NodeDef values_node;
-          CreateConstNode(values_tensor, StrCat(weights_node.name(), "/values"),
+          CreateConstNode(values_tensor,
+                          absl::StrCat(weights_node.name(), "/values"),
                           &values_node);
           SetNodeAttr("dtype", data_type, &values_node);
 
           // HashTable node
           NodeDef hashtable_node;
           hashtable_node.set_op("HashTable");
-          hashtable_node.set_name(StrCat(weights_node.name(), "/HashTable"));
+          hashtable_node.set_name(
+              absl::StrCat(weights_node.name(), "/HashTable"));
           SetNodeAttr("key_dtype", key_dtype, &hashtable_node);
           SetNodeAttr("value_dtype", data_type, &hashtable_node);
 
@@ -338,7 +384,7 @@ Status SparsifyGatherInternal(
           NodeDef init_table_node;
           init_table_node.set_op("InitializeTable");
           init_table_node.set_name(
-              StrCat(weights_node.name(), "/InitializeTable"));
+              absl::StrCat(weights_node.name(), "/InitializeTable"));
           SetNodeAttr("Tkey", key_dtype, &init_table_node);
           SetNodeAttr("Tval", data_type, &init_table_node);
           init_table_node_names.push_back(init_table_node.name());
@@ -346,7 +392,8 @@ Status SparsifyGatherInternal(
           // LookupTableFind node
           NodeDef lookup_node;
           lookup_node.set_op("LookupTableFind");
-          lookup_node.set_name(StrCat(gather_node.name(), "/LookupTableFind"));
+          lookup_node.set_name(
+              absl::StrCat(gather_node.name(), "/LookupTableFind"));
           SetNodeAttr("Tin", key_dtype, &lookup_node);
           SetNodeAttr("Tout", data_type, &lookup_node);
 
@@ -354,17 +401,18 @@ Status SparsifyGatherInternal(
           Tensor zero_tensor(data_type, TensorShape({}));
           zero_tensor.flat<float>()(0) = 0.0;
           NodeDef default_value_node;
-          CreateConstNode(zero_tensor, StrCat(gather_node.name(), "/Const"),
+          CreateConstNode(zero_tensor,
+                          absl::StrCat(gather_node.name(), "/Const"),
                           &default_value_node);
           SetNodeAttr("dtype", data_type, &default_value_node);
 
           // ExpandDims argument
           Tensor dim_idx(DT_INT32, TensorShape({}));
-          dim_idx.flat<int32>()(0) = -1;
+          dim_idx.flat<int32_t>()(0) = -1;
           NodeDef dim_idx_node;
           dim_idx_node.set_op("Const");
           dim_idx_node.set_name(
-              StrCat(gather_node.name(), "/ExpandDims/Const"));
+              absl::StrCat(gather_node.name(), "/ExpandDims/Const"));
           SetNodeAttr("value", dim_idx, &dim_idx_node);
           SetNodeAttr("dtype", DT_INT32, &dim_idx_node);
 
@@ -406,7 +454,7 @@ Status SparsifyGatherInternal(
           new_nodes->push_back(dim_idx_node);
           new_nodes->push_back(expand_dims_node);
 
-          return Status::OK();
+          return absl::OkStatus();
         },
         {true}, &replaced_graph_def));
 
@@ -424,9 +472,9 @@ Status SparsifyGatherInternal(
       init_op->set_op("NoOp");
       init_op->set_name(group_init_node);
     }
-    for (const string& name : init_table_node_names) {
+    for (const std::string& name : init_table_node_names) {
       // Add control dependence from init_table_node to group_deps_node
-      AddNodeInput(StrCat("^", name), init_op);
+      AddNodeInput(absl::StrCat("^", name), init_op);
       refs[name]++;
     }
 
@@ -440,7 +488,7 @@ Status SparsifyGatherInternal(
     }
 
     // Add nodes with a reference count of 0 for deletion.
-    for (auto entry : refs) {
+    for (const auto& entry : refs) {
       if (entry.second == 0) {
         removed_node_names.push_back(entry.first);
       }
@@ -462,32 +510,53 @@ Status SparsifyGatherInternal(
               removed_node_names.push_back(parsed_input);
             }
           }
-          replaced_graph_def.mutable_node()->SwapElements(
-              i, replaced_graph_def.node_size() - 1);
-          replaced_graph_def.mutable_node()->RemoveLast();
+          TF_RETURN_IF_ERROR(RemoveNodeAtIndex(&replaced_graph_def, i));
           continue;
         }
         int j = 0;
+        bool deleted_inputs = false;
         while (j < replaced_graph_def.node(i).input_size()) {
           if (replaced_graph_def.node(i).input(j) == name ||
               replaced_graph_def.node(i).input(j) == ("^" + name)) {
-            replaced_graph_def.mutable_node(i)->mutable_input()->SwapElements(
-                j, replaced_graph_def.node(i).input_size() - 1);
-            replaced_graph_def.mutable_node(i)->mutable_input()->RemoveLast();
+            TF_RETURN_IF_ERROR(
+                RemoveInputAtIndex(replaced_graph_def.mutable_node(i), j));
+            deleted_inputs = true;
             continue;
           }
           j++;
         }
-        if (!replaced_graph_def.node(i).input_size()) {
-          if ((refs.find(replaced_graph_def.node(i).name()) != refs.end()) &&
-              (refs[replaced_graph_def.node(i).name()] == 0)) {
+        if (deleted_inputs) {
+          if (replaced_graph_def.node(i).op() == "ConcatV2") {
+            if (replaced_graph_def.node(i).input_size() > 2) {
+              SetNodeAttr("N", replaced_graph_def.node(i).input_size() - 1,
+                          replaced_graph_def.mutable_node(i));
+            } else if (replaced_graph_def.node(i).input_size() == 2) {
+              if (refs[replaced_graph_def.node(i).input(1)] != 1) {
+                return errors::Internal(
+                    "Expect axis tensor of ConcatV2 node to only be referenced "
+                    "once.");
+              }
+              refs[replaced_graph_def.node(i).input(1)] -= 1;
+              removed_node_names.push_back(replaced_graph_def.node(i).input(1));
+              replaced_graph_def.mutable_node(i)->mutable_input()->RemoveLast();
+              replaced_graph_def.mutable_node(i)->mutable_attr()->erase("N");
+              replaced_graph_def.mutable_node(i)->set_op("Identity");
+            } else {
+              return errors::Internal(
+                  "ConcatV2 should have at least two elements");
+            }
+          }
+          if ((replaced_graph_def.node(i).op() == "Assign" ||
+               replaced_graph_def.node(i).op() == "Reshape" ||
+               replaced_graph_def.node(i).op() == "Equal" ||
+               replaced_graph_def.node(i).op() == "Mean" ||
+               replaced_graph_def.node(i).op() == "ScalarSummary") &&
+              replaced_graph_def.node(i).input_size() == 1) {
             removed_node_names.push_back(replaced_graph_def.node(i).name());
           }
-        }
-
-        if (replaced_graph_def.node(i).op() == "Assign" &&
-            replaced_graph_def.node(i).input_size() == 1) {
-          removed_node_names.push_back(replaced_graph_def.node(i).name());
+          if (!replaced_graph_def.node(i).input_size()) {
+            removed_node_names.push_back(replaced_graph_def.node(i).name());
+          }
         }
         i++;
       }
@@ -495,12 +564,12 @@ Status SparsifyGatherInternal(
     current_graph_def = replaced_graph_def;
   } while (any_match_found);
   *output_graph_def = current_graph_def;
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status SparsifyGather(const GraphDef& input_graph_def,
-                      const TransformFuncContext& context,
-                      GraphDef* output_graph_def) {
+absl::Status SparsifyGather(const GraphDef& input_graph_def,
+                            const TransformFuncContext& context,
+                            GraphDef* output_graph_def) {
   // clang-format off
   const OpTypePattern gather_pattern =
     {"Gather",
@@ -528,23 +597,29 @@ Status SparsifyGather(const GraphDef& input_graph_def,
     };
   // clang-format on
 
+  GraphDef cleaned_input_graph_def;
+  RemoveAttributes(input_graph_def, {"_output_shapes"},
+                   &cleaned_input_graph_def);
+
   GraphDef temp_output;
 
   std::unique_ptr<BundleReader> ckpt_reader;
   TF_RETURN_IF_ERROR(InitializeCheckpointReader(context, &ckpt_reader));
 
-  std::unique_ptr<std::unordered_map<string, string> > shapes_and_slices;
-  TF_RETURN_IF_ERROR(ObtainVariableInfo(input_graph_def, &shapes_and_slices));
+  std::unique_ptr<std::unordered_map<std::string, std::string>>
+      shapes_and_slices;
+  TF_RETURN_IF_ERROR(
+      ObtainVariableInfo(cleaned_input_graph_def, &shapes_and_slices));
 
-  TF_RETURN_IF_ERROR(SparsifyGatherInternal(input_graph_def, shapes_and_slices,
-                                            context, gather_pattern,
-                                            ckpt_reader, &temp_output));
+  TF_RETURN_IF_ERROR(SparsifyGatherInternal(
+      cleaned_input_graph_def, shapes_and_slices, context, gather_pattern,
+      ckpt_reader, &temp_output));
 
   TF_RETURN_IF_ERROR(SparsifyGatherInternal(temp_output, shapes_and_slices,
                                             context, gather_v2_pattern,
                                             ckpt_reader, output_graph_def));
 
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 REGISTER_GRAPH_TRANSFORM("sparsify_gather", SparsifyGather);

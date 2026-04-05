@@ -1,29 +1,20 @@
-package(default_visibility = ["//tensorflow:internal"])
+load("@xla//third_party/rules_python/python:py_library.bzl", "py_library")
 
-licenses(["notice"])  # Apache 2.0
-
-exports_files(["LICENSE"])
+package(
+    # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
+    licenses = ["notice"],
+)
 
 py_library(
     name = "data",
     srcs = ["__init__.py"],
-    srcs_version = "PY2AND3",
+    strict_deps = True,
+    visibility = ["//tensorflow:internal"],
     deps = [
-        "//tensorflow/python:util",
+        "//tensorflow/python/data/experimental",
         "//tensorflow/python/data/ops:dataset_ops",
         "//tensorflow/python/data/ops:iterator_ops",
+        "//tensorflow/python/data/ops:options",
         "//tensorflow/python/data/ops:readers",
     ],
-)
-
-filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-        ],
-    ),
-    visibility = ["//tensorflow:__subpackages__"],
 )

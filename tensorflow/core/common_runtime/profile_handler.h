@@ -29,22 +29,6 @@ class ProfileHandler {
   ProfileHandler() {}
   virtual ~ProfileHandler() {}
 
-  // Records that a miscellaneous activity occurred in the current step.
-  //
-  // Implementations of this method must be thread-safe.
-  //
-  // Args:
-  // - device: The device on which the activity occurred.
-  // - start: The time at which the activity started.
-  // - limit: The time at which the activity finished.
-  // - label: A label for the op, which may be used in visualization.
-  // - op_type: A type string for the op, which may be used in visualization.
-  // - details: A details string, which may be used in visualization.
-  // from time "start" to "limit" with "op_type" and "details".
-  virtual void RecordActivity(const string& device, Microseconds start,
-                              Microseconds limit, StringPiece label,
-                              StringPiece op_type, StringPiece details) = 0;
-
   // Records that a single Op was executed in the current step.
   //
   // Implementations of this method must be thread-safe.
@@ -56,9 +40,10 @@ class ProfileHandler {
   // - label: Extra content for timeline click text.
   // - op_type: String name of the Op.
   // - details: Main content for timeline click text.
-  virtual void RecordOneOp(const string& device, const NodeExecStats& stats,
-                           bool is_copy, StringPiece label, StringPiece op_type,
-                           StringPiece details) = 0;
+  virtual void RecordOneOp(const std::string& device,
+                           const NodeExecStats& stats, bool is_copy,
+                           absl::string_view label, absl::string_view op_type,
+                           absl::string_view details) = 0;
 
   // Records that the current step finished.
   //
@@ -72,7 +57,7 @@ class ProfileHandler {
   // - final_status: The status that this step finished with.
   virtual void StepDone(Microseconds start_time, Microseconds finish_time,
                         Microseconds cleanup_time, int total_runops,
-                        Status final_status) = 0;
+                        absl::Status final_status) = 0;
 
   // Returns true if the caller should collect rpc activity.
   virtual bool should_collect_rpcs() = 0;

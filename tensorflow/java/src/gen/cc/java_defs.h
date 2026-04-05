@@ -16,22 +16,24 @@ limitations under the License.
 #ifndef TENSORFLOW_JAVA_SRC_GEN_CC_JAVA_DEFS_H_
 #define TENSORFLOW_JAVA_SRC_GEN_CC_JAVA_DEFS_H_
 
+#include <list>
+#include <map>
 #include <string>
-#include <vector>
-#include <deque>
+#include <utility>
 
-#include "tensorflow/core/platform/env.h"
+#include "tensorflow/core/framework/types.h"
 
 namespace tensorflow {
 namespace java {
 
 // An enumeration of different modifiers commonly used in Java
 enum Modifier {
-  PUBLIC    = (1 << 0),
+  PACKAGE = 0,
+  PUBLIC = (1 << 0),
   PROTECTED = (1 << 1),
-  PRIVATE   = (1 << 2),
-  STATIC    = (1 << 3),
-  FINAL     = (1 << 4),
+  PRIVATE = (1 << 2),
+  STATIC = (1 << 3),
+  FINAL = (1 << 4),
 };
 
 class Annotation;
@@ -75,17 +77,19 @@ class Type {
     // Reflection API does
     return Type(Type::PRIMITIVE, "void");
   }
-  static Type Class(const string& name, const string& package = "") {
+  static Type Generic(const std::string& name) {
+    return Type(Type::GENERIC, name);
+  }
+  static Type Wildcard() { return Type(Type::GENERIC, ""); }
+  static Type Class(const std::string& name, const std::string& package = "") {
     return Type(Type::CLASS, name, package);
   }
-  static Type Interface(const string& name, const string& package = "") {
+  static Type Interface(const std::string& name,
+                        const std::string& package = "") {
     return Type(Type::INTERFACE, name, package);
   }
-  static Type Enum(const string& name, const string& package = "") {
+  static Type Enum(const std::string& name, const std::string& package = "") {
     return Type(Type::ENUM, name, package);
-  }
-  static Type Generic(const string& name = "") {
-    return Type(Type::GENERIC, name);
   }
   static Type ClassOf(const Type& type) {
     return Class("Class").add_parameter(type);
@@ -96,25 +100,52 @@ class Type {
   static Type IterableOf(const Type& type) {
     return Interface("Iterable").add_parameter(type);
   }
-  const Kind& kind() const { return kind_; }
-  const string& name() const { return name_; }
-  const string& package() const { return package_; }
-  const string& description() const { return description_; }
-  Type& description(const string& description) {
-    description_ = description;
-    return *this;
+  static Type ForDataType(DataType data_type) {
+    switch (data_type) {
+      case DataType::DT_BOOL:
+        return Class("Boolean");
+      case DataType::DT_STRING:
+        return Class("String");
+      case DataType::DT_FLOAT:
+        return Class("Float");
+      case DataType::DT_DOUBLE:
+        return Class("Double");
+      case DataType::DT_UINT8:
+        return Class("UInt8", "org.tensorflow.types");
+      case DataType::DT_INT32:
+        return Class("Integer");
+      case DataType::DT_INT64:
+        return Class("Long");
+      case DataType::DT_RESOURCE:
+        // TODO(karllessard) create a Resource utility class that could be
+        // used to store a resource and its type (passed in a second argument).
+        // For now, we need to force a wildcard and we will unfortunately lose
+        // track of the resource type.
+        // Falling through...
+      default:
+        // Any other datatypes does not have a equivalent in Java and must
+        // remain a wildcard (e.g. DT_COMPLEX64, DT_QINT8, ...)
+        return Wildcard();
+    }
   }
-  const std::vector<Type>& parameters() const { return parameters_; }
+  const Kind& kind() const { return kind_; }
+  const std::string& name() const { return name_; }
+  const std::string& package() const { return package_; }
+  const std::string canonical_name() const {
+    return package_.empty() ? name_ : package_ + "." + name_;
+  }
+  bool wildcard() const { return name_.empty(); }  // only wildcards has no name
+  const std::list<Type>& parameters() const { return parameters_; }
   Type& add_parameter(const Type& parameter) {
     parameters_.push_back(parameter);
     return *this;
   }
-  const std::vector<Annotation>& annotations() const { return annotations_; }
+  const std::list<Annotation>& annotations() const { return annotations_; }
   Type& add_annotation(const Annotation& annotation) {
     annotations_.push_back(annotation);
     return *this;
   }
-  const std::deque<Type>& supertypes() const { return supertypes_; }
+  const std::list<Type>& supertypes() const { return supertypes_; }
   Type& add_supertype(const Type& type) {
     if (type.kind_ == CLASS) {
       supertypes_.push_front(type);  // keep superclass at the front of the list
@@ -123,27 +154,18 @@ class Type {
     }
     return *this;
   }
-  // Returns true if "type" is of a known collection type (only a few for now)
-  bool IsCollection() const {
-    return name_ == "List" || name_ == "Iterable";
-  }
-  // Returns true if this instance is a wildcard (<?>)
-  bool IsWildcard() const {
-    return kind_ == GENERIC && name_.empty();
-  }
 
  protected:
-  Type(Kind kind, const string& name, const string& package = "")
-    : kind_(kind), name_(name), package_(package) {}
+  Type(Kind kind, const std::string& name, const std::string& package = "")
+      : kind_(kind), name_(name), package_(package) {}
 
  private:
   Kind kind_;
-  string name_;
-  string package_;
-  string description_;
-  std::vector<Type> parameters_;
-  std::vector<Annotation> annotations_;
-  std::deque<Type> supertypes_;
+  std::string name_;
+  std::string package_;
+  std::list<Type> parameters_;
+  std::list<Annotation> annotations_;
+  std::list<Type> supertypes_;
 };
 
 // Definition of a Java annotation
@@ -152,20 +174,21 @@ class Type {
 // giving optionally a set of attributes to initialize.
 class Annotation : public Type {
  public:
-  static Annotation Create(const string& type_name, const string& pkg = "") {
+  static Annotation Create(const std::string& type_name,
+                           const std::string& pkg = "") {
     return Annotation(type_name, pkg);
   }
-  const string& attributes() const { return attributes_; }
-  Annotation& attributes(const string& attributes) {
+  const std::string& attributes() const { return attributes_; }
+  Annotation& attributes(const std::string& attributes) {
     attributes_ = attributes;
     return *this;
   }
 
  private:
-  string attributes_;
+  std::string attributes_;
 
-  Annotation(const string& name, const string& package)
-    : Type(Kind::ANNOTATION, name, package) {}
+  Annotation(const std::string& name, const std::string& package)
+      : Type(Kind::ANNOTATION, name, package) {}
 };
 
 // A definition of a Java variable
@@ -174,28 +197,23 @@ class Annotation : public Type {
 // method argument, which can be documented.
 class Variable {
  public:
-  static Variable Create(const string& name, const Type& type) {
+  static Variable Create(const std::string& name, const Type& type) {
     return Variable(name, type, false);
   }
-  static Variable Varargs(const string& name, const Type& type) {
+  static Variable Varargs(const std::string& name, const Type& type) {
     return Variable(name, type, true);
   }
-  const string& name() const { return name_; }
+  const std::string& name() const { return name_; }
   const Type& type() const { return type_; }
   bool variadic() const { return variadic_; }
-  const string& description() const { return description_; }
-  Variable& description(const string& description) {
-    description_ = description;
-    return *this;
-  }
+
  private:
-  string name_;
+  std::string name_;
   Type type_;
   bool variadic_;
-  string description_;
 
-  Variable(const string& name, const Type& type, bool variadic)
-    : name_(name), type_(type), variadic_(variadic) {}
+  Variable(const std::string& name, const Type& type, bool variadic)
+      : name_(name), type_(type), variadic_(variadic) {}
 };
 
 // A definition of a Java class method
@@ -204,67 +222,66 @@ class Variable {
 // type and arguments.
 class Method {
  public:
-  static Method Create(const string& name, const Type& return_type) {
+  static Method Create(const std::string& name, const Type& return_type) {
     return Method(name, return_type, false);
   }
   static Method ConstructorFor(const Type& clazz) {
     return Method(clazz.name(), clazz, true);
   }
   bool constructor() const { return constructor_; }
-  const string& name() const { return name_; }
+  const std::string& name() const { return name_; }
   const Type& return_type() const { return return_type_; }
-  const string& description() const { return description_; }
-  Method& description(const string& description) {
-    description_ = description;
-    return *this;
-  }
-  const string& return_description() const { return return_description_; }
-  Method& return_description(const string& description) {
-    return_description_ = description;
-    return *this;
-  }
-  const std::vector<Variable>& arguments() const { return arguments_; }
-  Method& add_arguments(const std::vector<Variable>& args) {
-    arguments_.insert(arguments_.cend(), args.cbegin(), args.cend());
-    return *this;
-  }
+  const std::list<Variable>& arguments() const { return arguments_; }
   Method& add_argument(const Variable& var) {
     arguments_.push_back(var);
     return *this;
   }
-  const std::vector<Annotation>& annotations() const { return annotations_; }
+  const std::list<Annotation>& annotations() const { return annotations_; }
   Method& add_annotation(const Annotation& annotation) {
     annotations_.push_back(annotation);
     return *this;
   }
 
  private:
-  string name_;
+  std::string name_;
   Type return_type_;
   bool constructor_;
-  string description_;
-  string return_description_;
-  std::vector<Variable> arguments_;
-  std::vector<Annotation> annotations_;
+  std::list<Variable> arguments_;
+  std::list<Annotation> annotations_;
 
-  Method(const string& name, const Type& return_type, bool constructor)
-    : name_(name), return_type_(return_type), constructor_(constructor) {}
+  Method(const std::string& name, const Type& return_type, bool constructor)
+      : name_(name), return_type_(return_type), constructor_(constructor) {}
 };
 
-// A piece of code to read from a file.
-class Snippet {
+// A definition of a documentation bloc for a Java element (JavaDoc)
+class Javadoc {
  public:
-  static Snippet Create(const string& fname, Env* env = Env::Default()) {
-    return Snippet(fname, env);
+  static Javadoc Create(const std::string& brief = "") {
+    return Javadoc(brief);
   }
-  const string& data() const { return data_; }
+  const std::string& brief() const { return brief_; }
+  const std::string& details() const { return details_; }
+  Javadoc& details(const std::string& details) {
+    details_ = details;
+    return *this;
+  }
+  const std::list<std::pair<std::string, std::string>>& tags() const {
+    return tags_;
+  }
+  Javadoc& add_tag(const std::string& tag, const std::string& text) {
+    tags_.push_back(std::make_pair(tag, text));
+    return *this;
+  }
+  Javadoc& add_param_tag(const std::string& name, const std::string& text) {
+    return add_tag("param", name + " " + text);
+  }
 
  private:
-  string data_;
+  std::string brief_;
+  std::string details_;
+  std::list<std::pair<std::string, std::string>> tags_;
 
-  Snippet(const string& fname, Env* env) {
-    TF_CHECK_OK(ReadFileToString(env, fname, &data_));
-  }
+  explicit Javadoc(const std::string& brief) : brief_(brief) {}
 };
 
 }  // namespace java
