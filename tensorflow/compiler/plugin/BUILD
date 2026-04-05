@@ -13,6 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 
+load("//tensorflow/core/platform:rules_cc.bzl", "cc_library")
+
 """Configuration file for an XLA plugin.
 
   please don't check in changes to this file. to prevent changes appearing
@@ -28,10 +30,10 @@
   ** Please don't remove this file - it is supporting some 3rd party plugins **
 """
 
-licenses(["notice"])
-
 package(
+    # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
     default_visibility = ["//visibility:public"],
+    licenses = ["notice"],
 )
 
 cc_library(
@@ -48,18 +50,4 @@ cc_library(
     deps = [
         "//tensorflow/compiler/jit:xla_device",
     ],
-)
-
-#-----------------------------------------------------------------------------
-
-filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-        ],
-    ),
-    visibility = ["//tensorflow:__subpackages__"],
 )

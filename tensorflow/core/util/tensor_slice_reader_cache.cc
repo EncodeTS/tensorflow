@@ -17,21 +17,20 @@ limitations under the License.
 
 #include <utility>
 
-#include "tensorflow/core/lib/gtl/stl_util.h"
 #include "tensorflow/core/platform/logging.h"
 
 namespace tensorflow {
 
 namespace checkpoint {
 
-TensorSliceReaderCacheWrapper::TensorSliceReaderCacheWrapper() {}
+TensorSliceReaderCacheWrapper::TensorSliceReaderCacheWrapper() = default;
 TensorSliceReaderCacheWrapper::~TensorSliceReaderCacheWrapper() {
   delete cache_;
   cache_ = nullptr;
 }
 
 const TensorSliceReader* TensorSliceReaderCacheWrapper::GetReader(
-    const string& filepattern,
+    const std::string& filepattern,
     TensorSliceReader::OpenTableFunction open_function,
     int preferred_shard) const {
   mutex_lock l(mu_);
@@ -42,20 +41,20 @@ const TensorSliceReader* TensorSliceReaderCacheWrapper::GetReader(
                            preferred_shard);
 }
 
-TensorSliceReaderCache::TensorSliceReaderCache() {}
+TensorSliceReaderCache::TensorSliceReaderCache() = default;
 
 TensorSliceReaderCache::~TensorSliceReaderCache() {
-  for (auto pair : readers_) {
+  for (const auto& pair : readers_) {
     delete pair.second.second;
   }
 }
 
 const TensorSliceReader* TensorSliceReaderCache::GetReader(
-    const string& filepattern,
+    const std::string& filepattern,
     TensorSliceReader::OpenTableFunction open_function, int preferred_shard) {
   mutex_lock l(mu_);
 
-#if defined(__GXX_RTTI) ||  defined(_CPPRTTI)
+#if defined(__GXX_RTTI) || defined(_CPPRTTI)
   // Get the function pointer from the open_function value.
   TensorSliceReaderCache::OpenFuncType* func_ptr =
       open_function.target<TensorSliceReaderCache::OpenFuncType>();

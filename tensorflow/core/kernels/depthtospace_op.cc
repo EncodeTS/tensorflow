@@ -17,13 +17,15 @@ limitations under the License.
 
 #define EIGEN_USE_THREADS
 
+#include "tensorflow/core/kernels/depthtospace_op.h"
+
+#include <cmath>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
 
-#include "tensorflow/core/kernels/depthtospace_op.h"
-
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
+#include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
@@ -44,15 +46,19 @@ template <typename Device, typename T>
 class DepthToSpaceOp : public OpKernel {
  public:
   explicit DepthToSpaceOp(OpKernelConstruction* context) : OpKernel(context) {
-    string data_format_str;
+    std::string data_format_str;
     OP_REQUIRES_OK(context, context->GetAttr("data_format", &data_format_str));
     OP_REQUIRES(context, FormatFromString(data_format_str, &data_format_),
                 errors::InvalidArgument("Invalid data format"));
 
     OP_REQUIRES_OK(context, context->GetAttr("block_size", &block_size_));
-    OP_REQUIRES(context, block_size_ > 1,
-                errors::InvalidArgument("Block size should be > 1, but was: ",
-                                        block_size_));
+    // This upper bound is needed to avoid an overflow when the block size value
+    // is squared in the output computation.
+    int block_size_limit = sqrt(std::numeric_limits<int>::max());
+    OP_REQUIRES(context, block_size_ > 1 && block_size_ <= block_size_limit,
+                errors::InvalidArgument(
+                    "Block size should be > 1 and <= ", block_size_limit,
+                    " but was: ", block_size_));
 
     if (std::is_same<Device, CPUDevice>::value) {
       OP_REQUIRES(
@@ -103,28 +109,29 @@ class DepthToSpaceOp : public OpKernel {
 
     // Allocate output tensor.
     Tensor* outputs_tensor = nullptr;
+    TensorShape outputs_tensor_shape;
     OP_REQUIRES_OK(context,
-                   context->allocate_output(
-                       0,
-                       ShapeFromFormat(data_format_, batch_size, output_height,
-                                       output_width, output_depth),
-                       &outputs_tensor));
+                   ShapeFromFormatWithStatus(
+                       data_format_, batch_size, output_height, output_width,
+                       output_depth, &outputs_tensor_shape));
+    OP_REQUIRES_OK(context, context->allocate_output(0, outputs_tensor_shape,
+                                                     &outputs_tensor));
     auto Tinput = input.tensor<T, kDims>();
     auto Toutput = outputs_tensor->tensor<T, kDims>();
 
     if (std::is_same<Device, GPUDevice>::value) {
       if (is_int8x4) {
         // NCHW_VECT_C with 4 x qint8 can be treated as NCHW int32.
-        auto Tinput_v = input.template reinterpret_last_dimension<int32, 4>();
-        auto Toutput_v = outputs_tensor->reinterpret_last_dimension<int32, 4>();
-        functor::DepthToSpaceOpFunctor<GPUDevice, int32, FORMAT_NCHW> functor;
-        functor(context->eigen_device<GPUDevice>(), Tinput_v, block_size_,
+        auto Tinput_v = input.template reinterpret_last_dimension<int32_t, 4>();
+        auto Toutput_v =
+            outputs_tensor->reinterpret_last_dimension<int32_t, 4>();
+        functor::DepthToSpaceOpFunctor<Device, int32_t, FORMAT_NCHW> functor;
+        functor(context->eigen_device<Device>(), Tinput_v, block_size_,
                 Toutput_v);
         return;
       } else if (data_format_ == FORMAT_NCHW) {
-        functor::DepthToSpaceOpFunctor<GPUDevice, T, FORMAT_NCHW> functor;
-        functor(context->eigen_device<GPUDevice>(), Tinput, block_size_,
-                Toutput);
+        functor::DepthToSpaceOpFunctor<Device, T, FORMAT_NCHW> functor;
+        functor(context->eigen_device<Device>(), Tinput, block_size_, Toutput);
         return;
       }
     }
@@ -175,21 +182,30 @@ struct DepthToSpaceOpFunctor<CPUDevice, T, FORMAT_NHWC> {
 };
 }  // namespace functor
 
-#define REGISTER(type)                                                   \
-  REGISTER_KERNEL_BUILDER(                                               \
-      Name("DepthToSpace").Device(DEVICE_CPU).TypeConstraint<type>("T"), \
-      DepthToSpaceOp<CPUDevice, type>);
+#define REGISTER(type)                                                \
+  REGISTER_KERNEL_BUILDER(Name("DepthToSpace")                        \
+                              .Device(DEVICE_CPU)                     \
+                              .TypeConstraint<type>("T")              \
+                              .AttrConstraint("data_format", "NHWC"), \
+                          DepthToSpaceOp<CPUDevice, type>);
 
 TF_CALL_ALL_TYPES(REGISTER);
 #undef REGISTER
 
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 REGISTER_KERNEL_BUILDER(
     Name("DepthToSpace").Device(DEVICE_GPU).TypeConstraint<float>("T"),
     DepthToSpaceOp<GPUDevice, float>);
 REGISTER_KERNEL_BUILDER(
+    Name("DepthToSpace").Device(DEVICE_GPU).TypeConstraint<Eigen::half>("T"),
+    DepthToSpaceOp<GPUDevice, Eigen::half>);
+REGISTER_KERNEL_BUILDER(Name("DepthToSpace")
+                            .Device(DEVICE_GPU)
+                            .TypeConstraint<Eigen::bfloat16>("T"),
+                        DepthToSpaceOp<GPUDevice, Eigen::bfloat16>);
+REGISTER_KERNEL_BUILDER(
     Name("DepthToSpace").Device(DEVICE_GPU).TypeConstraint<qint8>("T"),
     DepthToSpaceOp<GPUDevice, qint8>);
-#endif  // GOOGLE_CUDA
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 }  // end namespace tensorflow

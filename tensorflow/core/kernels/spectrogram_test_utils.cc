@@ -20,6 +20,7 @@ limitations under the License.
 
 #include "tensorflow/core/lib/core/status_test_util.h"
 #include "tensorflow/core/lib/io/path.h"
+#include "tensorflow/core/lib/strings/numbers.h"
 #include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/lib/wav/wav_io.h"
 #include "tensorflow/core/platform/env.h"
@@ -140,9 +141,9 @@ void ReadCSVFileToComplexVectorOrDie(
       for (std::vector<string>::const_iterator j = parts.begin();
            j != parts.end(); ++j) {
         if (j->find_first_of("ij") != string::npos) {
-          strings::safe_strtod((*j).c_str(), &imaginary_part);
+          strings::safe_strtod(*j, &imaginary_part);
         } else {
-          strings::safe_strtod((*j).c_str(), &real_part);
+          strings::safe_strtod(*j, &real_part);
         }
       }
       data_line.push_back(std::complex<double>(real_part, imaginary_part));
@@ -162,7 +163,12 @@ void ReadCSVFileToArrayOrDie(const string& filename,
   std::vector<float> values;
   for (int l = 0; l < lines.size(); ++l) {
     values.clear();
-    CHECK(str_util::SplitAndParseAsFloats(lines[l], ',', &values));
+    std::vector<string> split_line = str_util::Split(lines[l], ",");
+    for (const string& token : split_line) {
+      float tmp;
+      CHECK(absl::SimpleAtof(token, &tmp));
+      values.push_back(tmp);
+    }
     array->push_back(values);
   }
 }
@@ -175,8 +181,9 @@ bool WriteDoubleVectorToFile(const string& file_name,
     return false;
   }
   for (int i = 0; i < data.size(); ++i) {
-    if (!file->Append(StringPiece(reinterpret_cast<const char*>(&(data[i])),
-                                  sizeof(data[i])))
+    if (!file
+             ->Append(absl::string_view(
+                 reinterpret_cast<const char*>(&(data[i])), sizeof(data[i])))
              .ok()) {
       LOG(ERROR) << "Failed to append to file " << file_name;
       return false;
@@ -197,8 +204,9 @@ bool WriteFloatVectorToFile(const string& file_name,
     return false;
   }
   for (int i = 0; i < data.size(); ++i) {
-    if (!file->Append(StringPiece(reinterpret_cast<const char*>(&(data[i])),
-                                  sizeof(data[i])))
+    if (!file
+             ->Append(absl::string_view(
+                 reinterpret_cast<const char*>(&(data[i])), sizeof(data[i])))
              .ok()) {
       LOG(ERROR) << "Failed to append to file " << file_name;
       return false;
@@ -219,8 +227,9 @@ bool WriteDoubleArrayToFile(const string& file_name, int size,
     return false;
   }
   for (int i = 0; i < size; ++i) {
-    if (!file->Append(StringPiece(reinterpret_cast<const char*>(&(data[i])),
-                                  sizeof(data[i])))
+    if (!file
+             ->Append(absl::string_view(
+                 reinterpret_cast<const char*>(&(data[i])), sizeof(data[i])))
              .ok()) {
       LOG(ERROR) << "Failed to append to file " << file_name;
       return false;
@@ -241,8 +250,9 @@ bool WriteFloatArrayToFile(const string& file_name, int size,
     return false;
   }
   for (int i = 0; i < size; ++i) {
-    if (!file->Append(StringPiece(reinterpret_cast<const char*>(&(data[i])),
-                                  sizeof(data[i])))
+    if (!file
+             ->Append(absl::string_view(
+                 reinterpret_cast<const char*>(&(data[i])), sizeof(data[i])))
              .ok()) {
       LOG(ERROR) << "Failed to append to file " << file_name;
       return false;
@@ -266,16 +276,18 @@ bool WriteComplexVectorToRawFloatFile(
   for (int i = 0; i < data.size(); ++i) {
     for (int j = 0; j < data[i].size(); ++j) {
       const float real_part(real(data[i][j]));
-      if (!file->Append(StringPiece(reinterpret_cast<const char*>(&real_part),
-                                    sizeof(real_part)))
+      if (!file->Append(
+                   absl::string_view(reinterpret_cast<const char*>(&real_part),
+                                     sizeof(real_part)))
                .ok()) {
         LOG(ERROR) << "Failed to append to file " << file_name;
         return false;
       }
 
       const float imag_part(imag(data[i][j]));
-      if (!file->Append(StringPiece(reinterpret_cast<const char*>(&imag_part),
-                                    sizeof(imag_part)))
+      if (!file->Append(
+                   absl::string_view(reinterpret_cast<const char*>(&imag_part),
+                                     sizeof(imag_part)))
                .ok()) {
         LOG(ERROR) << "Failed to append to file " << file_name;
         return false;

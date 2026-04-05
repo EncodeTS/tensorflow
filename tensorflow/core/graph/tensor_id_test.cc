@@ -23,10 +23,13 @@ limitations under the License.
 namespace tensorflow {
 namespace {
 
-string ParseHelper(const string& n) { return ParseTensorName(n).ToString(); }
+std::string ParseHelper(const std::string& n) {
+  return ParseTensorName(n).ToString();
+}
 
 TEST(TensorIdTest, ParseTensorName) {
   EXPECT_EQ(ParseHelper("W1"), "W1:0");
+  EXPECT_EQ(ParseHelper("W1:0"), "W1:0");
   EXPECT_EQ(ParseHelper("weights:0"), "weights:0");
   EXPECT_EQ(ParseHelper("W1:1"), "W1:1");
   EXPECT_EQ(ParseHelper("W1:17"), "W1:17");
@@ -34,18 +37,18 @@ TEST(TensorIdTest, ParseTensorName) {
   EXPECT_EQ(ParseHelper("^foo"), "^foo");
 }
 
-uint32 Skewed(random::SimplePhilox* rnd, int max_log) {
-  const uint32 space = 1 << (rnd->Rand32() % (max_log + 1));
+uint32_t Skewed(random::SimplePhilox* rnd, int max_log) {
+  const uint32_t space = 1 << (rnd->Rand32() % (max_log + 1));
   return rnd->Rand32() % space;
 }
 
-void BM_ParseTensorName(int iters, int arg) {
-  testing::StopTiming();
+void BM_ParseTensorName(::testing::benchmark::State& state) {
+  const int arg = state.range(0);
   random::PhiloxRandom philox(301, 17);
   random::SimplePhilox rnd(&philox);
-  std::vector<string> names;
+  std::vector<std::string> names;
   for (int i = 0; i < 100; i++) {
-    string name;
+    std::string name;
     switch (arg) {
       case 0: {  // Generate random names
         size_t len = Skewed(&rnd, 4);
@@ -53,7 +56,7 @@ void BM_ParseTensorName(int iters, int arg) {
           name += rnd.OneIn(4) ? '0' : 'a';
         }
         if (rnd.OneIn(3)) {
-          strings::StrAppend(&name, ":", rnd.Uniform(12));
+          absl::StrAppend(&name, ":", rnd.Uniform(12));
         }
         break;
       }
@@ -78,17 +81,39 @@ void BM_ParseTensorName(int iters, int arg) {
     }
     names.push_back(name);
   }
-  testing::StartTiming();
+
   TensorId id;
   int index = 0;
   int sum = 0;
-  while (--iters > 0) {
+  for (auto s : state) {
     id = ParseTensorName(names[index++ % names.size()]);
     sum += id.second;
   }
   VLOG(2) << sum;  // Prevent compiler from eliminating loop body
 }
 BENCHMARK(BM_ParseTensorName)->Arg(0)->Arg(1)->Arg(2)->Arg(3)->Arg(4)->Arg(5);
+
+TEST(TensorIdTest, IsTensorIdControl) {
+  std::string input = "^foo";
+  TensorId tensor_id = ParseTensorName(input);
+  EXPECT_TRUE(IsTensorIdControl(tensor_id));
+
+  input = "foo";
+  tensor_id = ParseTensorName(input);
+  EXPECT_FALSE(IsTensorIdControl(tensor_id));
+
+  input = "foo:2";
+  tensor_id = ParseTensorName(input);
+  EXPECT_FALSE(IsTensorIdControl(tensor_id));
+}
+
+TEST(TensorIdTest, PortZero) {
+  for (std::string input : {"foo", "foo:0"}) {
+    TensorId tensor_id = ParseTensorName(input);
+    EXPECT_EQ("foo", tensor_id.node());
+    EXPECT_EQ(0, tensor_id.index());
+  }
+}
 
 }  // namespace
 }  // namespace tensorflow

@@ -20,7 +20,7 @@ namespace tensorflow {
 
 namespace {
 
-static const string kCostModelLogTag = "COST_MODEL";
+static const std::string kCostModelLogTag = "COST_MODEL";
 
 }  // namespace
 
@@ -53,8 +53,8 @@ bool CostModelManager::RemoveCostModelForGraph(const Graph* graph) {
   return true;
 }
 
-Status CostModelManager::AddToCostGraphDef(const Graph* graph,
-                                           CostGraphDef* cost_graph) {
+absl::Status CostModelManager::AddToCostGraphDef(const Graph* graph,
+                                                 CostGraphDef* cost_graph) {
   mutex_lock l(mu_);
   // Get the cost model for the graph.
   auto it = cost_models_.find(graph);
@@ -63,7 +63,7 @@ Status CostModelManager::AddToCostGraphDef(const Graph* graph,
   }
   CostModel* cost_model = it->second;
   cost_model->AddToCostGraphDef(graph, cost_graph);
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 }  // namespace tensorflow

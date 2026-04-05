@@ -48,7 +48,7 @@ class DummyDevice : public DeviceBase {
 
 class StringSource : public TensorResponse::Source {
  public:
-  explicit StringSource(const string* s, int block_size)
+  explicit StringSource(const std::string* s, int block_size)
       : s_(s), stream_(nullptr), block_size_(block_size) {}
   ~StringSource() override { DeleteStream(); }
 
@@ -66,7 +66,7 @@ class StringSource : public TensorResponse::Source {
   }
 
  private:
-  const string* s_;
+  const std::string* s_;
   protobuf::io::ArrayInputStream* stream_;
   char space_[sizeof(protobuf::io::ArrayInputStream)];
   int block_size_;
@@ -83,7 +83,7 @@ class TensorResponseTest : public ::testing::Test {
     } else {
       src.AsProtoField(proto.mutable_tensor());
     }
-    string encoded;
+    std::string encoded;
     proto.AppendToString(&encoded);
 
     StringSource source(&encoded, 1024);
@@ -92,7 +92,7 @@ class TensorResponseTest : public ::testing::Test {
     DummyDevice cpu_device(Env::Default());
     response.InitAlloc(&cpu_device, AllocatorAttributes());
     for (int i = 0; i < 2; i++) {  // Twice so we exercise reuse of "response"
-      Status s = response.ParseFrom(&source);
+      absl::Status s = response.ParseFrom(&source);
       EXPECT_TRUE(s.ok());
 
       const RecvTensorResponse& meta = response.metadata();
@@ -112,7 +112,7 @@ class TensorResponseTest : public ::testing::Test {
     LOG(ERROR) << "DT: " << static_cast<int>(dt);
     for (int elems = 0; elems <= 10000; elems++) {
       if (elems < 100 || (elems % 1000 == 0)) {
-        Tensor a(dt, TensorShape({1, static_cast<int64>(v.size())}));
+        Tensor a(dt, TensorShape({1, static_cast<int64_t>(v.size())}));
         test::FillValues<T>(&a, v);
         Validate(a, (elems == 0), true);
       }
@@ -120,15 +120,15 @@ class TensorResponseTest : public ::testing::Test {
     }
   }
   void DoTestForStrings(DataType dt) {
-    gtl::InlinedVector<string, 4> v;
+    absl::InlinedVector<tstring, 4UL> v;
     LOG(ERROR) << "DT: string";
     for (int elems = 0; elems <= 10000; elems++) {
       if (elems < 100 || (elems % 1000 == 0)) {
-        Tensor a(dt, TensorShape({1, static_cast<int64>(v.size())}));
-        test::FillValues<string>(&a, v);
+        Tensor a(dt, TensorShape({1, static_cast<int64_t>(v.size())}));
+        test::FillValues<tstring>(&a, v);
         Validate(a, (elems == 0), true);
       }
-      v.push_back(strings::StrCat("This is string ", elems));
+      v.push_back(absl::StrCat("This is string ", elems));
     }
   }
 };
@@ -136,14 +136,14 @@ class TensorResponseTest : public ::testing::Test {
 TEST_F(TensorResponseTest, Simple) {
   DoTest<float>(DT_FLOAT);
   DoTest<double>(DT_DOUBLE);
-  DoTest<int32>(DT_INT32);
-  DoTest<uint16>(DT_UINT16);
-  DoTest<uint8>(DT_UINT8);
-  DoTest<int16>(DT_INT16);
-  DoTest<int8>(DT_INT8);
+  DoTest<int32_t>(DT_INT32);
+  DoTest<uint16_t>(DT_UINT16);
+  DoTest<uint8_t>(DT_UINT8);
+  DoTest<int16_t>(DT_INT16);
+  DoTest<int8_t>(DT_INT8);
   DoTest<complex64>(DT_COMPLEX64);
   DoTest<complex128>(DT_COMPLEX128);
-  DoTest<int64>(DT_INT64);
+  DoTest<int64_t>(DT_INT64);
   DoTest<bool>(DT_BOOL);
   DoTest<qint8>(DT_QINT8);
   DoTest<quint8>(DT_QUINT8);
@@ -156,54 +156,53 @@ TEST_F(TensorResponseTest, Simple) {
 
 TEST_F(TensorResponseTest, StringTensor) { DoTestForStrings(DT_STRING); }
 
-string MakeFloatTensorTestCase(int num_elems) {
-  std::vector<int8> v(num_elems);
+std::string MakeFloatTensorTestCase(int num_elems) {
+  std::vector<int8_t> v(num_elems);
   for (int i = 0; i < num_elems; i++) {
     v[i] = i % 10;
   }
-  Tensor src(DT_INT8, TensorShape({1, static_cast<int64>(v.size())}));
-  test::FillValues<int8>(&src, v);
+  Tensor src(DT_INT8, TensorShape({1, static_cast<int64_t>(v.size())}));
+  test::FillValues<int8_t>(&src, v);
 
   RecvTensorResponse proto;
   proto.set_is_dead(false);
   proto.set_send_start_micros(123456);
   src.AsProtoTensorContent(proto.mutable_tensor());
-  string encoded;
+  std::string encoded;
   proto.AppendToString(&encoded);
   return encoded;
 }
 
-static void BM_TensorResponse(int iters, int arg) {
-  testing::StopTiming();
-  string encoded = MakeFloatTensorTestCase(arg);
+static void BM_TensorResponse(::testing::benchmark::State& state) {
+  const int arg = state.range(0);
+
+  std::string encoded = MakeFloatTensorTestCase(arg);
   DummyDevice cpu_device(Env::Default());
-  testing::StartTiming();
-  while (--iters > 0) {
+  size_t bytes = 0;
+  for (auto i : state) {
     TensorResponse response;
     response.InitAlloc(&cpu_device, AllocatorAttributes());
     StringSource source(&encoded, -1);
-    Status s = response.ParseFrom(&source);
-    if (iters == 1) {
-      testing::SetLabel(
-          strings::StrCat("Bytes: ", response.tensor().TotalBytes()));
-    }
+    absl::Status s = response.ParseFrom(&source);
+    bytes = response.tensor().TotalBytes();
   }
+  state.SetLabel(absl::StrCat("Bytes: ", bytes));
 }
 BENCHMARK(BM_TensorResponse)->Arg(0)->Arg(1000)->Arg(100000);
 
-static void BM_TensorViaTensorProto(int iters, int arg) {
-  testing::StopTiming();
-  string encoded = MakeFloatTensorTestCase(arg);
-  testing::StartTiming();
-  while (--iters > 0) {
+static void BM_TensorViaTensorProto(::testing::benchmark::State& state) {
+  const int arg = state.range(0);
+
+  std::string encoded = MakeFloatTensorTestCase(arg);
+  size_t bytes = 0;
+  for (auto s : state) {
     RecvTensorResponse r;
     r.ParseFromString(encoded);
     Tensor t;
     CHECK(t.FromProto(r.tensor()));
-    if (iters == 1) {
-      testing::SetLabel(strings::StrCat("Bytes: ", t.TotalBytes()));
-    }
+    bytes = t.TotalBytes();
   }
+  state.SetLabel(absl::StrCat("Bytes: ", bytes));
 }
 BENCHMARK(BM_TensorViaTensorProto)->Arg(0)->Arg(1000)->Arg(100000);
 

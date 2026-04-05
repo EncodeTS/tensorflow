@@ -12,8 +12,16 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+
 #include "tensorflow/core/util/example_proto_fast_parsing.h"
 
+#include <cstdint>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "tensorflow/core/example/example.pb.h"
 #include "tensorflow/core/example/feature.pb.h"
 #include "tensorflow/core/lib/random/philox_random.h"
@@ -35,28 +43,29 @@ constexpr char kSparseInt64Key[] = "sparse_int64";
 constexpr char kSparseFloatKey[] = "sparse_float";
 constexpr char kSparseStringKey[] = "sparse_string";
 
-string SerializedToReadable(string serialized) {
-  string result;
+std::string SerializedToReadable(std::string serialized) {
+  std::string result;
   result += '"';
   for (char c : serialized)
-    result += strings::StrCat("\\x", strings::Hex(c, strings::ZERO_PAD_2));
+    absl::StrAppend(&result, "\\x", absl::Hex(c, absl::kZeroPad2));
   result += '"';
   return result;
 }
 
 template <class T>
-string Serialize(const T& example) {
-  string serialized;
+std::string Serialize(const T& example) {
+  std::string serialized;
   example.SerializeToString(&serialized);
   return serialized;
 }
 
 // Tests that serialized gets parsed identically by TestFastParse(..)
 // and the regular Example.ParseFromString(..).
-void TestCorrectness(const string& serialized) {
+void TestCorrectness(const std::string& serialized) {
   Example example;
   Example fast_example;
   EXPECT_TRUE(example.ParseFromString(serialized));
+  example.DiscardUnknownFields();
   EXPECT_TRUE(TestFastParse(serialized, &fast_example));
   EXPECT_EQ(example.DebugString(), fast_example.DebugString());
   if (example.DebugString() != fast_example.DebugString()) {
@@ -91,7 +100,7 @@ TEST(FastParse, IgnoresPrecedingUnknownTopLevelFields) {
       .mutable_int64_list()
       ->add_value(94043);
 
-  TestCorrectness(strings::StrCat(Serialize(example), Serialize(context)));
+  TestCorrectness(absl::StrCat(Serialize(example), Serialize(context)));
 }
 
 TEST(FastParse, IgnoresTrailingUnknownTopLevelFields) {
@@ -115,7 +124,7 @@ TEST(FastParse, IgnoresTrailingUnknownTopLevelFields) {
       .mutable_int64_list()
       ->add_value(1337);
 
-  TestCorrectness(strings::StrCat(Serialize(example), Serialize(context)));
+  TestCorrectness(absl::StrCat(Serialize(example), Serialize(context)));
 }
 
 TEST(FastParse, SingleInt64WithContext) {
@@ -129,7 +138,7 @@ TEST(FastParse, SingleInt64WithContext) {
       .mutable_int64_list()
       ->add_value(94043);
 
-  TestCorrectness(strings::StrCat(Serialize(example), Serialize(context)));
+  TestCorrectness(absl::StrCat(Serialize(example), Serialize(context)));
 }
 
 TEST(FastParse, DenseInt64WithContext) {
@@ -143,7 +152,7 @@ TEST(FastParse, DenseInt64WithContext) {
       .mutable_int64_list()
       ->add_value(15);
 
-  string serialized = Serialize(example) + Serialize(context);
+  std::string serialized = Serialize(example) + Serialize(context);
 
   {
     Example deserialized;
@@ -166,16 +175,20 @@ TEST(FastParse, Packed) {
       "\x0a\x0d\x0a\x0b\x0a\x03\x61\x67\x65\x12\x04\x1a\x02\x08\x0d");
 }
 
+TEST(FastParse, ValueBeforeKeyInMap) {
+  TestCorrectness("\x0a\x12\x0a\x10\x12\x09\x0a\x07\x0a\x05value\x0a\x03key");
+}
+
 TEST(FastParse, EmptyFeatures) {
   Example example;
   example.mutable_features();
   TestCorrectness(Serialize(example));
 }
 
-void TestCorrectnessJson(const string& json) {
+void TestCorrectnessJson(const std::string& json) {
   auto resolver = protobuf::util::NewTypeResolverForDescriptorPool(
       "type.googleapis.com", protobuf::DescriptorPool::generated_pool());
-  string serialized;
+  std::string serialized;
   auto s = protobuf::util::JsonToBinaryString(
       resolver, "type.googleapis.com/tensorflow.Example", json, &serialized);
   EXPECT_TRUE(s.ok()) << s;
@@ -209,7 +222,7 @@ TEST(FastParse, SingleInt64) {
   TestCorrectness(Serialize(example));
 }
 
-TEST(FastParse, SomeFeatures) {
+static std::string ExampleWithSomeFeatures() {
   Example example;
 
   (*example.mutable_features()->mutable_feature())[""];
@@ -240,16 +253,90 @@ TEST(FastParse, SomeFeatures) {
   int64_list->add_value(270);
   int64_list->add_value(86942);
 
-  TestCorrectness(Serialize(example));
+  return Serialize(example);
 }
 
-string RandStr(random::SimplePhilox* rng) {
+TEST(FastParse, SomeFeatures) { TestCorrectness(ExampleWithSomeFeatures()); }
+
+static void AddDenseFeature(const char* feature_name, DataType dtype,
+                            PartialTensorShape shape, bool variable_length,
+                            size_t elements_per_stride,
+                            FastParseExampleConfig* out_config) {
+  out_config->dense.emplace_back();
+  auto& new_feature = out_config->dense.back();
+  new_feature.feature_name = feature_name;
+  new_feature.dtype = dtype;
+  new_feature.shape = std::move(shape);
+  new_feature.default_value = Tensor(dtype, {});
+  new_feature.variable_length = variable_length;
+  new_feature.elements_per_stride = elements_per_stride;
+}
+
+static void AddSparseFeature(const char* feature_name, DataType dtype,
+                             FastParseExampleConfig* out_config) {
+  out_config->sparse.emplace_back();
+  auto& new_feature = out_config->sparse.back();
+  new_feature.feature_name = feature_name;
+  new_feature.dtype = dtype;
+}
+
+TEST(FastParse, StatsCollection) {
+  const size_t kNumExamples = 13;
+  std::vector<tstring> serialized(kNumExamples, ExampleWithSomeFeatures());
+
+  FastParseExampleConfig config_dense;
+  AddDenseFeature("bytes_list", DT_STRING, {2}, false, 2, &config_dense);
+  AddDenseFeature("float_list", DT_FLOAT, {2}, false, 2, &config_dense);
+  AddDenseFeature("int64_list", DT_INT64, {3}, false, 3, &config_dense);
+  config_dense.collect_feature_stats = true;
+
+  FastParseExampleConfig config_varlen;
+  AddDenseFeature("bytes_list", DT_STRING, {-1}, true, 1, &config_varlen);
+  AddDenseFeature("float_list", DT_FLOAT, {-1}, true, 1, &config_varlen);
+  AddDenseFeature("int64_list", DT_INT64, {-1}, true, 1, &config_varlen);
+  config_varlen.collect_feature_stats = true;
+
+  FastParseExampleConfig config_sparse;
+  AddSparseFeature("bytes_list", DT_STRING, &config_sparse);
+  AddSparseFeature("float_list", DT_FLOAT, &config_sparse);
+  AddSparseFeature("int64_list", DT_INT64, &config_sparse);
+  config_sparse.collect_feature_stats = true;
+
+  FastParseExampleConfig config_mixed;
+  AddDenseFeature("bytes_list", DT_STRING, {2}, false, 2, &config_mixed);
+  AddDenseFeature("float_list", DT_FLOAT, {-1}, true, 1, &config_mixed);
+  AddSparseFeature("int64_list", DT_INT64, &config_mixed);
+  config_mixed.collect_feature_stats = true;
+
+  for (const FastParseExampleConfig& config :
+       {config_dense, config_varlen, config_sparse, config_mixed}) {
+    {
+      Result result;
+      TF_CHECK_OK(FastParseExample(config, serialized, {}, nullptr, &result));
+      EXPECT_EQ(kNumExamples, result.feature_stats.size());
+      for (const PerExampleFeatureStats& stats : result.feature_stats) {
+        EXPECT_EQ(7, stats.features_count);
+        EXPECT_EQ(7, stats.feature_values_count);
+      }
+    }
+
+    {
+      Result result;
+      TF_CHECK_OK(FastParseSingleExample(config, serialized[0], &result));
+      EXPECT_EQ(1, result.feature_stats.size());
+      EXPECT_EQ(7, result.feature_stats[0].features_count);
+      EXPECT_EQ(7, result.feature_stats[0].feature_values_count);
+    }
+  }
+}
+
+std::string RandStr(random::SimplePhilox* rng) {
   static const char key_char_lookup[] =
       "0123456789{}~`!@#$%^&*()"
       "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
       "abcdefghijklmnopqrstuvwxyz";
   auto len = 1 + rng->Rand32() % 200;
-  string str;
+  std::string str;
   str.reserve(len);
   while (len-- > 0) {
     str.push_back(
@@ -262,18 +349,18 @@ string RandStr(random::SimplePhilox* rng) {
 void Fuzz(random::SimplePhilox* rng) {
   // Generate keys.
   auto num_keys = 1 + rng->Rand32() % 100;
-  std::unordered_set<string> unique_keys;
+  std::unordered_set<std::string> unique_keys;
   for (auto i = 0; i < num_keys; ++i) {
     unique_keys.emplace(RandStr(rng));
   }
 
   // Generate serialized example.
   Example example;
-  string serialized_example;
+  std::string serialized_example;
   auto num_concats = 1 + rng->Rand32() % 4;
   std::vector<Feature::KindCase> feat_types(
       {Feature::kBytesList, Feature::kFloatList, Feature::kInt64List});
-  std::vector<string> all_keys(unique_keys.begin(), unique_keys.end());
+  std::vector<std::string> all_keys(unique_keys.begin(), unique_keys.end());
   while (num_concats--) {
     example.Clear();
     auto num_active_keys = 1 + rng->Rand32() % all_keys.size();
@@ -325,7 +412,7 @@ void Fuzz(random::SimplePhilox* rng) {
 }
 
 TEST(FastParse, FuzzTest) {
-  const uint64 seed = 1337;
+  const uint64_t seed = 1337;
   random::PhiloxRandom philox(seed);
   random::SimplePhilox rng(&philox);
   auto num_runs = 200;
@@ -335,44 +422,182 @@ TEST(FastParse, FuzzTest) {
   }
 }
 
-string MakeSerializedExample() {
-  Example example;
-  const int kFeatureNameLength = 10;
-  const int kFeatureValueLength = 20;
-  const int kBytesFeatureCount = 200;
-  const int kFloatFeatureCount = 200;
-  const int kInt64FeatureCount = 200;
-  auto& fmap = *example.mutable_features()->mutable_feature();
-  for (int i = 0; i < kBytesFeatureCount; ++i) {
-    fmap[strings::StrCat(string('b', kFeatureNameLength), i)]
-        .mutable_bytes_list()
-        ->add_value(string('v', kFeatureValueLength));
-  }
-  for (int i = 0; i < kFloatFeatureCount; ++i) {
-    fmap[strings::StrCat(string('f', kFeatureNameLength), i)]
-        .mutable_float_list()
-        ->add_value(123123123.123);
-  }
-  for (int i = 0; i < kInt64FeatureCount; ++i) {
-    fmap[strings::StrCat(string('i', kFeatureNameLength), i)]
-        .mutable_int64_list()
-        ->add_value(10 * i);
-  }
-  string serialized;
-  example.SerializeToString(&serialized);
-  return serialized;
-}
-
 TEST(TestFastParseExample, Empty) {
   Result result;
   FastParseExampleConfig config;
   config.sparse.push_back({"test", DT_STRING});
-  Status status = FastParseExample(config, gtl::ArraySlice<string>(),
-                                   gtl::ArraySlice<string>(), nullptr, &result);
+  absl::Status status =
+      FastParseExample(config, absl::Span<const tstring>(),
+                       absl::Span<const tstring>(), nullptr, &result);
   EXPECT_TRUE(status.ok()) << status;
 }
 
-}  // namespace
+TEST(FastParse, OOB_Write_Vulnerability_NonPacked_FloatList) {
+  FastParseExampleConfig config;
+  AddDenseFeature("f", DT_FLOAT, {1}, false, 1, &config);
 
+  auto encode_varint = [](uint32_t v, std::string* out) {
+    while (v >= 0x80) {
+      out->push_back((v & 0x7f) | 0x80);
+      v >>= 7;
+    }
+    out->push_back(v);
+  };
+
+  std::string float_list_data;
+  int num_elements = 10000;  // Large number to force crash
+  for (int i = 0; i < num_elements; ++i) {
+    float_list_data.push_back(13);  // kFixed32Tag(1)
+    float v = 1.0f;
+    const char* p = reinterpret_cast<const char*>(&v);
+    float_list_data.append(p, 4);
+  }
+
+  std::string serialized_feature;
+  serialized_feature.push_back(18);  // kDelimitedTag(2) for float_list
+  encode_varint(float_list_data.size(), &serialized_feature);
+  serialized_feature.append(float_list_data);
+
+  std::string map_entry;
+  map_entry.push_back(10);  // kDelimitedTag(1) for key
+  map_entry.push_back(1);
+  map_entry.push_back('f');
+  map_entry.push_back(18);  // kDelimitedTag(2) for value
+  encode_varint(serialized_feature.size(), &map_entry);
+  map_entry.append(serialized_feature);
+
+  std::string features_msg;
+  features_msg.push_back(10);  // kDelimitedTag(1) for map entry
+  encode_varint(map_entry.size(), &features_msg);
+  features_msg.append(map_entry);
+
+  std::string serialized_example;
+  serialized_example.push_back(10);  // kDelimitedTag(1) for features
+  encode_varint(features_msg.size(), &serialized_example);
+  serialized_example.append(features_msg);
+
+  Result result;
+  std::vector<tstring> serialized_vec = {tstring(serialized_example)};
+  absl::Status parse_status =
+      FastParseExample(config, serialized_vec, {}, nullptr, &result);
+
+  // We expect this to fail with INVALID_ARGUMENT due to size mismatch,
+  // but WITHOUT crashing.
+  EXPECT_FALSE(parse_status.ok());
+  EXPECT_TRUE(absl::IsInvalidArgument(parse_status));
+}
+
+TEST(FastParse, DenseFloat_TooManyElements_ReportsError) {
+  FastParseExampleConfig config;
+  AddDenseFeature("f", DT_FLOAT, {1}, false, 1, &config);
+
+  auto encode_varint = [](uint32_t v, std::string* out) {
+    while (v >= 0x80) {
+      out->push_back((v & 0x7f) | 0x80);
+      v >>= 7;
+    }
+    out->push_back(v);
+  };
+
+  std::string float_list_data;
+  int num_elements = 5;  // Expecting 1, but providing 5
+  for (int i = 0; i < num_elements; ++i) {
+    float_list_data.push_back(13);  // kFixed32Tag(1)
+    float v = 1.0f;
+    const char* p = reinterpret_cast<const char*>(&v);
+    float_list_data.append(p, 4);
+  }
+
+  std::string serialized_feature;
+  serialized_feature.push_back(18);  // kDelimitedTag(2) for float_list
+  encode_varint(float_list_data.size(), &serialized_feature);
+  serialized_feature.append(float_list_data);
+
+  std::string map_entry;
+  map_entry.push_back(10);  // kDelimitedTag(1) for key
+  map_entry.push_back(1);
+  map_entry.push_back('f');
+  map_entry.push_back(18);  // kDelimitedTag(2) for value
+  encode_varint(serialized_feature.size(), &map_entry);
+  map_entry.append(serialized_feature);
+
+  std::string features_msg;
+  features_msg.push_back(10);  // kDelimitedTag(1) for map entry
+  encode_varint(map_entry.size(), &features_msg);
+  features_msg.append(map_entry);
+
+  std::string serialized_example;
+  serialized_example.push_back(10);  // kDelimitedTag(1) for features
+  encode_varint(features_msg.size(), &serialized_example);
+  serialized_example.append(features_msg);
+
+  Result result;
+  std::vector<tstring> serialized_vec = {tstring(serialized_example)};
+  absl::Status parse_status =
+      FastParseExample(config, serialized_vec, {}, nullptr, &result);
+
+  EXPECT_FALSE(parse_status.ok());
+  EXPECT_TRUE(absl::IsInvalidArgument(parse_status));
+  EXPECT_NE(parse_status.ToString().find("Number of float values != expected"),
+            std::string::npos);
+}
+
+TEST(FastParse, DenseFloat_TooFewElements_ReportsError) {
+  FastParseExampleConfig config;
+  // Expecting 3 elements per stride
+  AddDenseFeature("f", DT_FLOAT, {3}, false, 3, &config);
+
+  auto encode_varint = [](uint32_t v, std::string* out) {
+    while (v >= 0x80) {
+      out->push_back((v & 0x7f) | 0x80);
+      v >>= 7;
+    }
+    out->push_back(v);
+  };
+
+  std::string float_list_data;
+  int num_elements = 1;  // Providing only 1
+  for (int i = 0; i < num_elements; ++i) {
+    float_list_data.push_back(13);  // kFixed32Tag(1)
+    float v = 1.0f;
+    const char* p = reinterpret_cast<const char*>(&v);
+    float_list_data.append(p, 4);
+  }
+
+  std::string serialized_feature;
+  serialized_feature.push_back(18);  // kDelimitedTag(2) for float_list
+  encode_varint(float_list_data.size(), &serialized_feature);
+  serialized_feature.append(float_list_data);
+
+  std::string map_entry;
+  map_entry.push_back(10);  // kDelimitedTag(1) for key
+  map_entry.push_back(1);
+  map_entry.push_back('f');
+  map_entry.push_back(18);  // kDelimitedTag(2) for value
+  encode_varint(serialized_feature.size(), &map_entry);
+  map_entry.append(serialized_feature);
+
+  std::string features_msg;
+  features_msg.push_back(10);  // kDelimitedTag(1) for map entry
+  encode_varint(map_entry.size(), &features_msg);
+  features_msg.append(map_entry);
+
+  std::string serialized_example;
+  serialized_example.push_back(10);  // kDelimitedTag(1) for features
+  encode_varint(features_msg.size(), &serialized_example);
+  serialized_example.append(features_msg);
+
+  Result result;
+  std::vector<tstring> serialized_vec = {tstring(serialized_example)};
+  absl::Status parse_status =
+      FastParseExample(config, serialized_vec, {}, nullptr, &result);
+
+  EXPECT_FALSE(parse_status.ok());
+  EXPECT_TRUE(absl::IsInvalidArgument(parse_status));
+  EXPECT_NE(parse_status.ToString().find("Number of float values != expected"),
+            std::string::npos);
+}
+
+}  // namespace
 }  // namespace example
 }  // namespace tensorflow

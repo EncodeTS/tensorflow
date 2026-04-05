@@ -16,45 +16,27 @@ limitations under the License.
 #ifndef TENSORFLOW_JAVA_SRC_GEN_CC_SOURCE_WRITER_H_
 #define TENSORFLOW_JAVA_SRC_GEN_CC_SOURCE_WRITER_H_
 
+#include <list>
+#include <set>
+#include <stack>
 #include <string>
 
+#include "xla/tsl/platform/status.h"
 #include "tensorflow/core/lib/core/stringpiece.h"
 #include "tensorflow/core/platform/env.h"
+#include "tensorflow/core/platform/file_system.h"
+#include "tensorflow/core/platform/types.h"
+#include "tensorflow/java/src/gen/cc/java_defs.h"
 
 namespace tensorflow {
+namespace java {
 
-// A utility class for writing source code, normally generated at
-// compile-time.
-//
-// Source writers are language-agnostic and therefore only expose generic
-// methods common to most languages. Extend or wrap this class to implement
-// language-specific features.
-//
-// Note: if you are looking to reuse this class for generating code in another
-// language than Java, please do by moving it at the '//tensorflow/core/lib/io'
-// level.
+// A class for writing Java source code.
 class SourceWriter {
  public:
-  virtual ~SourceWriter() = default;
+  SourceWriter();
 
-  // Returns true if the writer is at the beginnig of a new line
-  bool newline() const { return newline_; }
-
-  // Appends a piece of code or text.
-  //
-  // It is expected that no newline character is present in the data provided,
-  // otherwise Write() must be used.
-  SourceWriter& Append(const StringPiece& str);
-
-  // Writes a block of code or text.
-  //
-  // The data might potentially contain newline characters, therefore it will
-  // be scanned to ensure that each line is indented and prefixed properly,
-  // making it a bit slower than Append().
-  SourceWriter& Write(const string& text);
-
-  // Appends a newline character and start writing on a new line.
-  SourceWriter& EndLine();
+  virtual ~SourceWriter();
 
   // Indents following lines with white spaces.
   //
@@ -75,18 +57,163 @@ class SourceWriter {
   // Indent(2)->Prefix("//") will result in prefixing lines with "  //".
   //
   // An empty value ("") will remove any line prefix that was previously set.
-  SourceWriter& Prefix(const char* line_prefix) {
-    line_prefix_ = line_prefix;
-    return *this;
-  }
+  SourceWriter& Prefix(const char* line_prefix);
+
+  // Writes a source code snippet.
+  //
+  // The data might potentially contain newline characters, therefore it will
+  // be scanned to ensure that each line is indented and prefixed properly,
+  // making it a bit slower than Append().
+  SourceWriter& Write(const absl::string_view& str);
+
+  // Writes a source code snippet read from a file.
+  //
+  // All lines of the file at the provided path will be read and written back
+  // to the output of this writer in regard of its current attributes (e.g.
+  // the indentation, prefix, etc.)
+  SourceWriter& WriteFromFile(const std::string& fname,
+                              Env* env = Env::Default());
+
+  // Appends a piece of source code.
+  //
+  // It is expected that no newline character is present in the data provided,
+  // otherwise Write() must be used.
+  SourceWriter& Append(const absl::string_view& str);
+
+  // Appends a type to the current line.
+  //
+  // The type is written in its simple form (i.e. not prefixed by its package)
+  // and followed by any parameter types it has enclosed in brackets (<>).
+  SourceWriter& AppendType(const Type& type);
+
+  // Appends a newline character.
+  //
+  // Data written after calling this method will start on a new line, in respect
+  // of the current indentation.
+  SourceWriter& EndLine();
+
+  // Begins a block of source code.
+  //
+  // This method appends a new opening brace to the current data and indent the
+  // next lines according to Google Java Style Guide. The block can optionally
+  // be preceded by an expression (e.g. Append("if(true)").BeginBlock();)
+  SourceWriter& BeginBlock(const std::string& expression = "");
+
+  // Ends the current block of source code.
+  //
+  // This method appends a new closing brace to the current data and outdent the
+  // next lines back to the margin used before BeginBlock() was invoked.
+  SourceWriter& EndBlock();
+
+  // Begins to write a method.
+  //
+  // This method outputs the signature of the Java method from the data passed
+  // in the 'method' parameter and starts a new block. Modifiers are also passed
+  // in parameter to define the access scope of this method and, optionally,
+  // a Javadoc.
+  SourceWriter& BeginMethod(const Method& method, int modifiers,
+                            const Javadoc* javadoc = nullptr);
+
+  // Ends the current method.
+  //
+  // This method ends the block of code that has begun when invoking
+  // BeginMethod() prior to this.
+  SourceWriter& EndMethod();
+
+  // Begins to write the main type of a source file.
+  //
+  // This method outputs the declaration of the Java type from the data passed
+  // in the 'type' parameter and starts a new block. Modifiers are also passed
+  // in parameter to define the access scope of this type and, optionally,
+  // a Javadoc.
+  //
+  // If not null, all types found in the 'extra_dependencies' list will be
+  // imported before declaring the new type.
+  SourceWriter& BeginType(const Type& type, int modifiers,
+                          const std::list<Type>* extra_dependencies = nullptr,
+                          const Javadoc* javadoc = nullptr);
+
+  // Begins to write a new inner type.
+  //
+  // This method outputs the declaration of the Java type from the data passed
+  // in the 'type' parameter and starts a new block. Modifiers are also passed
+  // in parameter to define the accesses and the scope of this type and,
+  // optionally, a Javadoc.
+  SourceWriter& BeginInnerType(const Type& type, int modifiers,
+                               const Javadoc* javadoc = nullptr);
+
+  // Ends the current type.
+  //
+  // This method ends the block of code that has begun when invoking
+  // BeginType() or BeginInnerType() prior to this.
+  SourceWriter& EndType();
+
+  // Writes a variable as fields of a type.
+  //
+  // This method must be called within the definition of a type (see BeginType()
+  // or BeginInnerType()). Modifiers are also be passed in parameter to define
+  // the accesses and the scope of this field and, optionally, a Javadoc.
+  SourceWriter& WriteField(const Variable& field, int modifiers,
+                           const Javadoc* javadoc = nullptr);
 
  protected:
-  virtual void DoAppend(const StringPiece& str) = 0;
+  virtual void DoAppend(const absl::string_view& str) = 0;
 
  private:
-  string left_margin_;
-  string line_prefix_;
+  // A utility base class for visiting elements of a type.
+  class TypeVisitor {
+   public:
+    virtual ~TypeVisitor() = default;
+    void Visit(const Type& type);
+
+   protected:
+    virtual void DoVisit(const Type& type) = 0;
+  };
+
+  // A utility class for keeping track of declared generics in a given scope.
+  class GenericNamespace : public TypeVisitor {
+   public:
+    GenericNamespace() = default;
+    explicit GenericNamespace(const GenericNamespace* parent)
+      : generic_names_(parent->generic_names_) {}
+    std::list<const Type*> declared_types() {
+      return declared_types_;
+    }
+   protected:
+    virtual void DoVisit(const Type& type);
+
+   private:
+    std::list<const Type*> declared_types_;
+    std::set<std::string> generic_names_;
+  };
+
+  // A utility class for collecting a list of import statements to declare.
+  class TypeImporter : public TypeVisitor {
+   public:
+    explicit TypeImporter(const std::string& current_package)
+        : current_package_(current_package) {}
+    virtual ~TypeImporter() = default;
+    const std::set<std::string> imports() { return imports_; }
+
+   protected:
+    virtual void DoVisit(const Type& type);
+
+   private:
+    std::string current_package_;
+    std::set<std::string> imports_;
+  };
+
+  std::string left_margin_;
+  std::string line_prefix_;
   bool newline_ = true;
+  std::stack<GenericNamespace*> generic_namespaces_;
+
+  SourceWriter& WriteModifiers(int modifiers);
+  SourceWriter& WriteJavadoc(const Javadoc& javadoc);
+  SourceWriter& WriteAnnotations(const std::list<Annotation>& annotations);
+  SourceWriter& WriteGenerics(const std::list<const Type*>& generics);
+  GenericNamespace* PushGenericNamespace(int modifiers);
+  void PopGenericNamespace();
 };
 
 // A writer that outputs source code into a file.
@@ -99,7 +226,7 @@ class SourceFileWriter : public SourceWriter {
   virtual ~SourceFileWriter() = default;
 
  protected:
-  void DoAppend(const StringPiece& str) override {
+  void DoAppend(const absl::string_view& str) override {
     TF_CHECK_OK(file_->Append(str));
   }
 
@@ -110,24 +237,25 @@ class SourceFileWriter : public SourceWriter {
 // A writer that outputs source code into a string buffer.
 class SourceBufferWriter : public SourceWriter {
  public:
-  SourceBufferWriter() : owns_buffer_(true), buffer_(new string()) {}
-  explicit SourceBufferWriter(string* buffer)
+  SourceBufferWriter() : owns_buffer_(true), buffer_(new std::string()) {}
+  explicit SourceBufferWriter(std::string* buffer)
       : owns_buffer_(false), buffer_(buffer) {}
   virtual ~SourceBufferWriter() {
     if (owns_buffer_) delete buffer_;
   }
-  const string& str() { return *buffer_; }
+  const std::string& str() { return *buffer_; }
 
  protected:
-  void DoAppend(const StringPiece& str) override {
+  void DoAppend(const absl::string_view& str) override {
     buffer_->append(str.begin(), str.end());
   }
 
  private:
   bool owns_buffer_;
-  string* buffer_;
+  std::string* buffer_;
 };
 
+}  // namespace java
 }  // namespace tensorflow
 
 #endif  // TENSORFLOW_JAVA_SRC_GEN_CC_SOURCE_WRITER_H_
